@@ -1,0 +1,518 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="theme-color" content="#00705f" />
+  <title>国家电网错题本</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            primary: {
+              50: '#e6f2f0',
+              100: '#cde8e4',
+              200: '#aad9d2',
+              300: '#6fc4b8',
+              500: '#0e9d8a',
+              600: '#00705f',
+              700: '#005a4c',
+            }
+          }
+        }
+      }
+    }
+  </script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/font-awesome@4.7.0/css/font-awesome.min.css" />
+  <link rel="stylesheet" href="css/style.css?v=27" />
+</head>
+<body class="bg-slate-100 min-h-screen text-slate-800">
+
+  <!-- 顶部导航 -->
+  <header class="bg-white shadow-sm sticky top-0 z-20">
+    <div class="max-w-4xl mx-auto px-4">
+      <div class="flex flex-wrap items-center justify-between gap-y-1.5 gap-x-2 py-2 sm:h-16 sm:py-0">
+        <h1 class="flex items-center gap-1.5 shrink-0 whitespace-nowrap">
+          <img src="logo.png" alt="国家电网" class="h-7 sm:h-8 w-auto shrink-0" />
+          <span class="text-base sm:text-lg font-bold text-primary-600 whitespace-nowrap">错题本</span>
+        </h1>
+        <nav class="flex items-center gap-1 shrink-0 w-full sm:w-auto sm:justify-end">
+          <div class="relative shrink-0 sm:mr-1">
+            <button id="backup-btn" class="px-2 py-2 rounded-lg text-slate-500 hover:bg-slate-100 transition" title="备份 / 恢复">
+              <i class="fa fa-cog text-lg"></i>
+            </button>
+            <div id="backup-menu" class="hidden absolute left-0 top-full mt-1 w-36 bg-white rounded-lg shadow-lg border border-slate-200 py-1 z-50">
+              <button id="export-btn" class="w-full text-left px-4 py-2 text-sm text-slate-700 hover:bg-slate-50 transition whitespace-nowrap"><i class="fa fa-download mr-2 text-slate-400"></i>导出备份</button>
+              <button id="import-btn" class="w-full text-left px-4 py-2 text-sm text-slate-700 hover:bg-slate-50 transition whitespace-nowrap"><i class="fa fa-upload mr-2 text-slate-400"></i>导入备份</button>
+            </div>
+            <input type="file" id="import-file" accept=".json" multiple class="hidden" />
+          </div>
+          <button data-tab="input" class="tab-btn flex-1 sm:flex-none px-2 sm:px-3 py-2 rounded-lg font-medium transition text-sm sm:text-base whitespace-nowrap">
+            <i class="fa fa-plus mr-1 hidden sm:inline"></i>录入
+          </button>
+          <button data-tab="review" class="tab-btn flex-1 sm:flex-none px-2 sm:px-3 py-2 rounded-lg font-medium transition text-sm sm:text-base whitespace-nowrap">
+            <i class="fa fa-tasks mr-1 hidden sm:inline"></i>复习
+            <span id="due-badge" class="hidden ml-1 bg-red-500 text-white text-xs rounded-full px-2 py-0.5"></span>
+          </button>
+          <button data-tab="bank" class="tab-btn flex-1 sm:flex-none px-2 sm:px-3 py-2 rounded-lg font-medium transition text-sm sm:text-base whitespace-nowrap">
+            <i class="fa fa-book mr-1 hidden sm:inline"></i>题库
+          </button>
+          <button data-tab="list" class="tab-btn flex-1 sm:flex-none px-2 sm:px-3 py-2 rounded-lg font-medium transition text-sm sm:text-base whitespace-nowrap">
+            <i class="fa fa-list mr-1 hidden sm:inline"></i>错题
+          </button>
+        </nav>
+      </div>
+    </div>
+  </header>
+
+  <main class="max-w-4xl mx-auto px-4 py-5">
+
+    <!-- ============ 录入错题 ============ -->
+    <section id="tab-input" class="tab-panel">
+      <div id="input-paste" class="bg-white rounded-xl shadow-sm p-5 space-y-4">
+        <div class="flex items-center justify-between">
+          <h2 id="input-title" class="font-semibold"><i class="fa fa-edit text-primary-500 mr-1"></i>录入题目</h2>
+          <button id="to-json-input" type="button" class="px-3 py-1.5 rounded-lg bg-slate-100 text-slate-600 text-xs font-medium hover:bg-slate-200 transition whitespace-nowrap">
+            <i class="fa fa-file-code-o mr-1"></i>JSON 录入
+          </button>
+        </div>
+
+        <div class="flex bg-slate-100 rounded-lg p-1">
+          <button data-type="single" class="type-btn flex-1 py-2 rounded-md font-medium transition text-sm">单选</button>
+          <button data-type="multiple" class="type-btn flex-1 py-2 rounded-md font-medium transition text-sm">多选</button>
+          <button data-type="judge" class="type-btn flex-1 py-2 rounded-md font-medium transition text-sm">判断</button>
+        </div>
+
+        <div>
+          <label class="text-sm font-medium text-slate-600">错题来源科目（可选，默认未分类）</label>
+          <div id="subject-selector" class="mt-2 flex flex-wrap gap-2"></div>
+        </div>
+
+        <div>
+          <label class="text-sm font-medium text-slate-600">题干</label>
+          <div class="relative mt-1">
+            <textarea id="q-text" rows="4" class="w-full rounded-lg border border-slate-300 px-3 pr-8 py-2 text-sm focus:ring-2 focus:ring-primary-300 focus:outline-none" placeholder="把整段文字（题干 + 选项）粘贴到这里，再点下方「拆分题干 / 选项」按钮"></textarea>
+            <button type="button" class="input-clear hidden absolute right-2 top-2.5 text-slate-400 hover:text-slate-600" data-target="#q-text"><i class="fa fa-times-circle"></i></button>
+          </div>
+          <div class="mt-2 flex justify-end">
+            <button id="split-btn" type="button" class="px-3 py-1.5 rounded-lg bg-slate-100 text-slate-600 text-xs font-medium hover:bg-slate-200 transition">
+              <i class="fa fa-magic mr-1"></i>拆分题干 / 选项
+            </button>
+          </div>
+          <div class="mt-2 flex items-center gap-2">
+            <img id="q-image-preview" class="rounded-lg border border-slate-200 max-h-20 max-w-full hidden" alt="题干图片" />
+            <button id="q-image-btn" type="button" class="px-2.5 py-1.5 rounded-lg bg-slate-100 text-slate-600 text-xs font-medium hover:bg-slate-200 transition shrink-0">
+              <i class="fa fa-image mr-1"></i>上传题干图片
+            </button>
+            <button id="q-image-remove" type="button" class="px-2 py-1.5 rounded-lg text-red-500 text-xs font-medium hover:bg-red-50 transition shrink-0 hidden">
+              <i class="fa fa-trash-o"></i>
+            </button>
+            <input type="file" id="q-image-file" accept="image/*" class="hidden" />
+          </div>
+        </div>
+
+        <div>
+          <label class="text-sm font-medium text-slate-600">选项（点字母选答案，可为每个选项上传图片）</label>
+          <div id="options-wrap" class="mt-2 space-y-2"></div>
+          <p id="answer-hint" class="text-xs text-slate-400 mt-2"></p>
+        </div>
+
+        <div>
+          <label class="text-sm font-medium text-slate-600">备注 / 错因（可选）</label>
+          <div class="relative mt-1">
+            <input id="q-note" class="w-full rounded-lg border border-slate-300 px-3 pr-8 py-2 text-sm focus:ring-2 focus:ring-primary-300 focus:outline-none" placeholder="例如：概念不清、审题错误" />
+            <button type="button" class="input-clear hidden absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600" data-target="#q-note"><i class="fa fa-times-circle"></i></button>
+          </div>
+        </div>
+
+        <button id="save-btn" class="w-full bg-primary-600 hover:bg-primary-700 text-white font-semibold py-2.5 rounded-lg transition">
+          <i class="fa fa-check mr-1"></i><span id="save-btn-text">保存错题</span>
+        </button>
+      </div>
+
+      <!-- JSON 录入 -->
+      <div id="input-json" class="bg-white rounded-xl shadow-sm p-5 space-y-4 hidden">
+        <div class="flex items-center justify-between">
+          <h2 class="font-semibold"><i class="fa fa-file-code-o text-primary-500 mr-1"></i>JSON 录入</h2>
+          <button id="to-paste-input" type="button" class="px-3 py-1.5 rounded-lg bg-slate-100 text-slate-600 text-xs font-medium hover:bg-slate-200 transition whitespace-nowrap">
+            <i class="fa fa-arrow-left mr-1"></i>返回粘贴录入
+          </button>
+        </div>
+
+        <div class="p-3 bg-emerald-50 border border-emerald-200 rounded-lg">
+          <p class="text-xs text-emerald-700 mb-2"><i class="fa fa-bolt mr-1"></i>最快方式：把试卷照片交给 AI 转成 JSON。复制提示词 → 粘贴到豆包 / DeepSeek 对话框 → 上传题目照片。</p>
+          <button id="copy-prompt-btn" type="button" class="w-full py-2.5 rounded-lg bg-primary-600 hover:bg-primary-700 text-white font-semibold transition text-sm">
+            <i class="fa fa-copy mr-1"></i>一键复制 AI 提示词
+          </button>
+        </div>
+
+        <p class="text-sm text-slate-500">上传 JSON 文件批量录入题目，可以是别人的备份文件，也可以是自己按规则生成的文件。导入后一律当作你的全新题目（已清空复习进度）。</p>
+
+        <button id="json-upload-btn" type="button" class="w-full bg-primary-600 hover:bg-primary-700 text-white font-semibold py-2.5 rounded-lg transition">
+          <i class="fa fa-upload mr-1"></i>上传 JSON 文件
+        </button>
+        <input type="file" id="json-file" accept=".json,application/json" class="hidden" />
+
+        <div>
+          <label class="text-sm font-medium text-slate-600">或粘贴 JSON 内容</label>
+          <div class="relative mt-1">
+            <textarea id="json-text" rows="8" class="w-full rounded-lg border border-slate-300 px-3 pr-8 py-2 text-sm font-mono focus:ring-2 focus:ring-primary-300 focus:outline-none" placeholder='粘贴 JSON 数组内容，例如 [ { "type": "single", "question_text": "题干", "options": [...], "answer": ["D"] } ]'></textarea>
+            <button type="button" class="input-clear hidden absolute right-2 top-2.5 text-slate-400 hover:text-slate-600" data-target="#json-text"><i class="fa fa-times-circle"></i></button>
+          </div>
+          <button id="json-parse-btn" type="button" class="mt-2 w-full py-2.5 rounded-lg bg-primary-600 hover:bg-primary-700 text-white font-semibold transition">
+            <i class="fa fa-check mr-1"></i>解析录入
+          </button>
+        </div>
+
+        <button id="json-rule-btn" type="button" class="w-full py-2.5 rounded-lg bg-slate-100 text-slate-600 font-medium hover:bg-slate-200 transition text-sm">
+          <i class="fa fa-question-circle mr-1"></i>查看 JSON 格式规则和示例
+        </button>
+
+        <div id="json-rule-panel" class="hidden text-sm space-y-3">
+          <div class="p-3 bg-slate-50 rounded-lg text-slate-600 leading-relaxed">
+            <p class="font-medium text-slate-700 mb-1">格式说明</p>
+            <ul class="list-disc pl-4 space-y-0.5">
+              <li>整体是一个 JSON 数组 <code>[ ... ]</code>，每道题是一个对象；粘贴时带 <code>```json</code> 代码块或前后解释文字也能自动识别</li>
+              <li><code>type</code>：single=单选、multiple=多选、judge=判断（写成「单选/多选/判断」也能识别）</li>
+              <li><code>question_text</code>：题干文字（写成 question / stem / title 也能识别）</li>
+              <li><code>options</code>：选项数组，每个选项用对象 { "label":"A", "text":"内容" }；也可直接写成字符串数组 ["选项A", "选项B", ...]（会自动识别 A./B./1. 前缀）；选项可加 image 放图片</li>
+              <li><code>answer</code>：正确选项字母数组，单选如 ["D"]，多选如 ["A","C"]（也可写成 "AC" 或 "A,C"），判断 ["A"]=对、["B"]=错</li>
+              <li><code>note</code>：备注（可选）</li>
+              <li><code>question_image</code>：题干图片（可选，填图片网址或 base64）</li>
+              <li><code>subject</code>：错题来源科目（可选）：电路 / 电机 / 电分 / 继保 / 高压 / 设备 / 电力电子 / 行测，不填为未分类</li>
+            </ul>
+          </div>
+
+          <div>
+            <p class="font-medium text-slate-700 mb-1">纯文本题目示例</p>
+            <pre class="bg-slate-800 text-slate-100 rounded-lg p-3 overflow-x-auto text-xs leading-relaxed">[
+  {
+    "type": "single",
+    "question_text": "下列关于潮流计算的计算机算法中，错误的是",
+    "options": [
+      { "label": "A", "text": "牛顿-拉夫逊法按平方关系收敛，效果最好" },
+      { "label": "B", "text": "PQ分解法按线性关系收敛，速度慢于牛顿法" },
+      { "label": "C", "text": "PQ分解法主要用于输电系统潮流计算" },
+      { "label": "D", "text": "PQ分解法计算速度最快，高斯-赛德尔最慢" }
+    ],
+    "answer": ["D"],
+    "note": "潮流计算",
+    "subject": "电分"
+  },
+  {
+    "type": "judge",
+    "question_text": "电力系统的频率是衡量电能质量的重要指标之一",
+    "options": [
+      { "label": "A", "text": "正确" },
+      { "label": "B", "text": "错误" }
+    ],
+    "answer": ["A"]
+  }
+]</pre>
+          </div>
+
+          <div>
+            <p class="font-medium text-slate-700 mb-1">带图片题目示例</p>
+            <pre class="bg-slate-800 text-slate-100 rounded-lg p-3 overflow-x-auto text-xs leading-relaxed">[
+  {
+    "type": "single",
+    "question_text": "下图为某正弦交流电路，求等效阻抗",
+    "question_image": "data:image/png;base64,iVBORw0KGgo...(题干图片的base64编码，或 https:// 图片网址)",
+    "options": [
+      { "label": "A", "text": "10Ω" },
+      { "label": "B", "text": "20Ω" },
+      { "label": "C", "text": "30Ω" },
+      { "label": "D", "text": "40Ω", "image": "data:image/png;base64,...(选项图片)" }
+    ],
+    "answer": ["B"]
+  }
+]</pre>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 今日复习 ============ -->
+    <section id="tab-review" class="tab-panel hidden">
+      <div class="bg-white rounded-xl shadow-sm p-6">
+        <div class="flex items-center justify-between mb-3">
+          <h2 class="text-lg font-semibold"><i class="fa fa-tasks text-primary-500 mr-1"></i>今日复习</h2>
+          <div class="text-sm text-slate-500">待复习 <span id="review-count" class="font-bold text-primary-600">0</span> 题</div>
+        </div>
+        <div id="review-stats" class="mb-4 flex flex-wrap gap-2 text-xs"></div>
+        <div id="review-empty" class="text-center py-16 text-slate-400">
+          <i class="fa fa-check-circle text-5xl"></i>
+          <p class="mt-3">今天没有需要复习的题目</p>
+        </div>
+        <div id="review-box" class="hidden pb-28">
+          <div class="flex items-center justify-between text-xs text-slate-400 mb-3">
+            <span id="review-progress"></span>
+            <div class="flex items-center gap-2">
+              <span id="review-type-badge" class="px-2 py-0.5 rounded-full bg-slate-100 font-medium"></span>
+              <button id="review-subject-btn" class="text-slate-400 hover:text-primary-500 transition hidden" title="设置科目"><i class="fa fa-tag"></i></button>
+            </div>
+          </div>
+          <div id="review-cnt" class="mb-3 flex flex-wrap gap-2 text-xs"></div>
+          <div id="review-question" class="text-base font-medium whitespace-pre-wrap"></div>
+          <img id="review-image" class="hidden mt-3 max-h-72 rounded-lg" alt="" />
+          <div id="review-options" class="mt-4 space-y-2"></div>
+          <div id="review-result" class="hidden mt-4"></div>
+          <div id="review-ai-row" class="mt-3 hidden">
+            <button id="review-ai-btn" type="button" class="w-full py-2.5 rounded-lg bg-primary-600 hover:bg-primary-700 text-white font-semibold transition">
+              <i class="fa fa-magic mr-1"></i>AI 解析
+            </button>
+          </div>
+          <div id="review-note-display" class="hidden mt-3 p-3 bg-amber-50 border border-amber-200 rounded-lg text-sm">
+            <div class="font-semibold text-amber-700 mb-1.5"><i class="fa fa-sticky-note-o mr-1"></i>笔记</div>
+            <div id="review-note-list"></div>
+          </div>
+          <div id="review-note-editor" class="hidden mt-3">
+            <div class="relative">
+              <textarea id="review-note-text" rows="3" class="w-full rounded-lg border border-slate-300 px-3 pr-8 py-2 text-sm focus:ring-2 focus:ring-primary-300 focus:outline-none" placeholder="记下错因、易错点、口诀..."></textarea>
+              <button type="button" class="input-clear hidden absolute right-2 top-2.5 text-slate-400 hover:text-slate-600" data-target="#review-note-text"><i class="fa fa-times-circle"></i></button>
+            </div>
+            <div class="mt-2 flex gap-2">
+              <button id="review-note-save" class="flex-1 py-2 rounded-lg bg-primary-600 text-white font-medium hover:bg-primary-700 transition text-sm"><i class="fa fa-check mr-1"></i>保存笔记</button>
+              <button id="review-note-cancel" class="flex-1 py-2 rounded-lg bg-slate-100 text-slate-600 font-medium hover:bg-slate-200 transition text-sm">取消</button>
+            </div>
+          </div>
+          <div class="mt-3 flex gap-2">
+            <button id="review-note-btn" class="flex-1 py-2.5 rounded-lg bg-slate-100 text-slate-600 font-semibold hover:bg-slate-200 transition hidden"><i class="fa fa-sticky-note-o mr-1"></i>添加笔记</button>
+            <button id="review-edit-btn" class="flex-1 py-2.5 rounded-lg bg-slate-100 text-slate-600 font-semibold hover:bg-slate-200 transition hidden"><i class="fa fa-pencil mr-1"></i>修改题目</button>
+          </div>
+          <div class="mt-3 flex gap-2">
+            <button id="review-delete" class="flex-1 py-2.5 rounded-lg bg-red-50 text-red-600 font-semibold border border-red-200 hover:bg-red-100 transition hidden"><i class="fa fa-trash-o mr-1"></i>删除此题</button>
+          </div>
+
+          <!-- 固定底部操作栏 -->
+          <div id="review-actions" class="fixed bottom-0 left-0 right-0 z-30 bg-white border-t border-slate-200 px-3 py-2.5" style="padding-bottom: calc(0.625rem + env(safe-area-inset-bottom));">
+            <div class="max-w-4xl mx-auto flex items-center gap-2">
+              <button id="review-back" type="button" class="hidden shrink-0 px-4 py-2.5 rounded-lg bg-slate-100 text-slate-600 font-medium hover:bg-slate-200 transition text-sm">
+                <i class="fa fa-arrow-left mr-1"></i>返回
+              </button>
+              <button id="answer-sheet-btn" type="button" class="shrink-0 px-4 py-2.5 rounded-lg bg-slate-100 text-slate-600 font-medium hover:bg-slate-200 transition text-sm">
+                <i class="fa fa-th mr-1"></i>答题卡
+              </button>
+              <button id="submit-answer" type="button" class="flex-1 py-2.5 rounded-lg bg-primary-600 hover:bg-primary-700 text-white font-semibold transition">提交答案</button>
+            </div>
+          </div>
+
+          <!-- 左右边缘翻题按钮（上一题/下一题）：宽屏大、窄屏小 -->
+          <button id="prev-question" type="button" class="side-btn opacity-40" disabled>
+            <i class="fa fa-arrow-left"></i><span class="side-label">上一题</span>
+          </button>
+          <button id="next-question" type="button" class="side-btn hidden">
+            <i class="fa fa-arrow-right"></i><span class="side-label">下一题</span>
+          </button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 题库 ============ -->
+    <section id="tab-bank" class="tab-panel hidden">
+      <!-- 分类列表 -->
+      <div id="bank-categories">
+        <div class="bg-white rounded-xl shadow-sm p-6">
+          <h2 class="text-lg font-semibold mb-4"><i class="fa fa-book text-primary-500 mr-1"></i>2027 国网公共与行业知识</h2>
+          <div id="bank-cat-list" class="grid grid-cols-1 sm:grid-cols-2 gap-3"></div>
+        </div>
+      </div>
+
+      <!-- 刷题 -->
+      <div id="bank-quiz" class="hidden">
+        <div class="bg-white rounded-xl shadow-sm p-6 pb-28">
+          <div class="flex items-center justify-between text-xs text-slate-400 mb-3">
+            <span id="bank-progress"></span>
+            <span id="bank-type-badge"></span>
+          </div>
+          <div id="bank-question" class="text-base font-medium whitespace-pre-wrap"></div>
+          <div id="bank-options" class="mt-4 space-y-2"></div>
+          <div id="bank-result" class="hidden mt-4"></div>
+
+          <!-- 固定底部操作栏 -->
+          <div class="fixed bottom-0 left-0 right-0 z-30 bg-white border-t border-slate-200 px-3 py-2.5" style="padding-bottom: calc(0.625rem + env(safe-area-inset-bottom));">
+            <div class="max-w-4xl mx-auto flex items-center gap-2">
+              <button id="bank-sheet-btn" type="button" class="shrink-0 px-4 py-2.5 rounded-lg bg-slate-100 text-slate-600 font-medium hover:bg-slate-200 transition text-sm">
+                <i class="fa fa-th mr-1"></i>答题卡
+              </button>
+              <button id="bank-submit" type="button" class="flex-1 py-2.5 rounded-lg bg-primary-600 hover:bg-primary-700 text-white font-semibold transition">提交答案</button>
+            </div>
+          </div>
+
+          <!-- 左右边缘翻题按钮（上一题/下一题） -->
+          <button id="bank-prev" type="button" class="side-btn opacity-40" disabled>
+            <i class="fa fa-arrow-left"></i><span class="side-label">上一题</span>
+          </button>
+          <button id="bank-next" type="button" class="side-btn hidden">
+            <i class="fa fa-arrow-right"></i><span class="side-label">下一题</span>
+          </button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 错题列表 ============ -->
+    <section id="tab-list" class="tab-panel hidden">
+      <div class="bg-white rounded-xl shadow-sm p-6">
+        <div class="flex items-center justify-between mb-4">
+          <h2 class="text-lg font-semibold"><i class="fa fa-list text-primary-500 mr-1"></i>错题列表</h2>
+          <div class="flex items-center gap-2">
+            <span id="list-total-wrap" class="text-sm text-slate-500">共 <span id="list-total" class="font-bold text-primary-600">0</span> 题</span>
+            <button id="batch-btn" class="px-3 py-1.5 rounded-lg bg-slate-100 text-slate-600 font-medium hover:bg-slate-200 transition text-sm whitespace-nowrap"><i class="fa fa-trash-o mr-1"></i>删除题目</button>
+          </div>
+        </div>
+        <div id="list-filter-bar" class="mb-3">
+          <div class="relative">
+            <i class="fa fa-search absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 text-sm"></i>
+            <input id="list-search" type="text" class="w-full rounded-lg border border-slate-300 pl-9 pr-8 py-2 text-sm focus:ring-2 focus:ring-primary-300 focus:outline-none" placeholder="搜索题干 / 选项 / 备注" />
+            <button id="list-search-clear" class="hidden absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600"><i class="fa fa-times-circle"></i></button>
+          </div>
+        </div>
+        <!-- 主列表题型切换（单选/多选/判断） -->
+        <div id="list-type-tabs" class="grid grid-cols-4 gap-2 mb-4"></div>
+        <!-- 错题来源入口（行测 + 7 个科目） -->
+        <div id="source-entry" class="mb-4 space-y-2">
+          <button id="bank-entry-btn" type="button" class="w-full flex items-center gap-3 px-4 py-3 rounded-xl border border-primary-200 bg-primary-50 hover:bg-primary-100 transition text-left">
+            <i class="fa fa-book text-primary-600 text-lg"></i>
+            <span class="flex-1 text-sm font-semibold text-slate-700">行测</span>
+            <span id="bank-entry-count" class="text-xs text-slate-500"></span>
+            <i class="fa fa-chevron-right text-slate-300"></i>
+          </button>
+          <div id="subject-entry-list" class="space-y-2"></div>
+        </div>
+        <!-- 子视图头部（进入「行测」或某个科目后显示） -->
+        <div id="sub-view-head" class="hidden mb-3">
+          <div class="flex items-center gap-2 mb-2">
+            <button id="sub-view-back" class="inline-flex items-center gap-1 text-primary-600 font-medium text-sm hover:text-primary-700 transition"><i class="fa fa-arrow-left"></i>返回错题列表</button>
+            <span id="sub-view-title" class="text-sm font-semibold text-slate-700"></span>
+          </div>
+        </div>
+        <!-- 删除模式操作栏（吸顶，仅删除模式显示） -->
+        <div id="batch-bar" class="hidden sticky top-24 sm:top-16 z-20 -mx-6 px-6 py-3 bg-white shadow-sm mb-4">
+          <div class="flex items-center gap-2">
+            <span class="text-sm font-medium text-primary-700">已选 <span id="batch-count">0</span> 道</span>
+            <button id="batch-select-current" class="px-3 py-1.5 rounded-lg bg-primary-500 text-white text-sm font-medium hover:bg-primary-600 transition">全选本页</button>
+            <button id="batch-delete" class="ml-auto px-3 py-1.5 rounded-lg bg-red-500 text-white text-sm font-medium hover:bg-red-600 transition"><i class="fa fa-trash mr-1"></i>删除选中</button>
+            <button id="batch-cancel" class="px-3 py-1.5 rounded-lg bg-slate-100 text-slate-600 text-sm font-medium hover:bg-slate-200 transition">取消</button>
+          </div>
+        </div>
+        <div id="list-wrap" class="space-y-3"></div>
+        <div id="list-pager" class="hidden mt-4">
+          <div class="flex items-center justify-center gap-3">
+            <button id="list-prev" class="px-4 py-2 rounded-lg bg-slate-100 text-slate-600 font-medium hover:bg-slate-200 transition text-sm"><i class="fa fa-angle-left mr-1"></i>上一页</button>
+            <span id="list-page-info" class="text-sm text-slate-500"></span>
+            <button id="list-next" class="px-4 py-2 rounded-lg bg-slate-100 text-slate-600 font-medium hover:bg-slate-200 transition text-sm">下一页<i class="fa fa-angle-right ml-1"></i></button>
+          </div>
+          <div class="flex items-center justify-center gap-2 mt-2">
+            <span class="text-xs text-slate-400">每页</span>
+            <div class="relative">
+              <button class="size-toggle flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-medium bg-slate-100 text-slate-600 transition hover:bg-slate-200" data-scope="list">
+                <span class="size-current">50</span><i class="fa fa-caret-down"></i>
+              </button>
+              <div class="size-menu hidden absolute bottom-full left-1/2 -translate-x-1/2 mb-1 w-16 bg-white rounded-lg shadow-lg border border-slate-200 py-1 z-30">
+                <button class="size-btn w-full px-4 py-1.5 text-xs text-slate-600 hover:bg-slate-50 transition" data-size="20" data-scope="list">20</button>
+                <button class="size-btn w-full px-4 py-1.5 text-xs text-slate-600 hover:bg-slate-50 transition" data-size="50" data-scope="list">50</button>
+                <button class="size-btn w-full px-4 py-1.5 text-xs text-slate-600 hover:bg-slate-50 transition" data-size="100" data-scope="list">100</button>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div id="list-empty" class="text-center py-16 text-slate-400 hidden">
+          <i class="fa fa-inbox text-5xl"></i>
+          <p id="list-empty-text" class="mt-3">还没有录入错题</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 题目详情 ============ -->
+    <section id="tab-detail" class="tab-panel hidden">
+      <div class="bg-white rounded-xl shadow-sm p-6">
+        <button id="back-to-list" class="mb-4 inline-flex items-center gap-1.5 text-primary-600 font-medium hover:text-primary-700 transition">
+          <i class="fa fa-arrow-left"></i> 返回错题列表
+        </button>
+        <div id="detail-content"></div>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- 答题卡弹层 -->
+  <div id="answer-sheet-modal" class="hidden fixed inset-0 z-40 bg-black/50 flex items-center justify-center p-4">
+    <div class="bg-white rounded-xl w-full max-w-lg max-h-[80vh] flex flex-col overflow-hidden">
+      <div class="flex items-center justify-between px-4 py-3 border-b border-slate-200 shrink-0">
+        <h3 class="font-semibold"><i class="fa fa-th text-primary-500 mr-1"></i><span id="answer-sheet-title">答题卡</span></h3>
+        <button id="answer-sheet-close" type="button" class="text-slate-400 hover:text-slate-600 transition"><i class="fa fa-times text-lg"></i></button>
+      </div>
+      <div class="flex-1 overflow-y-auto p-4">
+        <div class="flex flex-wrap gap-x-4 gap-y-1 mb-3 text-xs text-slate-500">
+          <span class="inline-flex items-center gap-1"><i class="w-3 h-3 rounded-full bg-green-500 inline-block"></i>正确</span>
+          <span class="inline-flex items-center gap-1"><i class="w-3 h-3 rounded-full bg-red-500 inline-block"></i>错误</span>
+          <span class="inline-flex items-center gap-1"><i class="w-3 h-3 rounded-full bg-slate-300 inline-block"></i>未做</span>
+        </div>
+        <div id="answer-sheet-grid" class="grid grid-cols-5 gap-2"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 相似题目确认弹窗 -->
+  <div id="dup-modal" class="hidden fixed inset-0 z-40 bg-black/50 flex items-center justify-center p-4">
+    <div class="bg-white rounded-xl w-full max-w-lg max-h-[85vh] flex flex-col overflow-hidden">
+      <div class="px-4 py-3 border-b border-slate-200 shrink-0">
+        <h3 class="font-semibold"><i class="fa fa-exclamation-triangle text-amber-500 mr-1"></i>发现相似题目，请确认</h3>
+      </div>
+      <div class="flex-1 overflow-y-auto p-4 space-y-3">
+        <div id="dup-new"></div>
+        <div class="flex items-center gap-2 text-xs text-slate-400">
+          <span class="flex-1 border-t border-slate-200"></span>对比题库里已有的<span class="flex-1 border-t border-slate-200"></span>
+        </div>
+        <div id="dup-old"></div>
+      </div>
+      <div class="px-4 py-3 border-t border-slate-200 shrink-0 flex flex-col gap-2">
+        <button id="dup-keep" type="button" class="w-full py-2.5 rounded-lg bg-primary-600 hover:bg-primary-700 text-white font-semibold transition text-sm">不是同一题，仍要保存</button>
+        <button id="dup-skip" type="button" class="w-full py-2.5 rounded-lg bg-slate-100 text-slate-600 font-semibold hover:bg-slate-200 transition text-sm">是同一题，跳过</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 设置科目弹层 -->
+  <div id="subject-modal" class="hidden fixed inset-0 z-40 bg-black/50 flex items-center justify-center p-4">
+    <div class="bg-white rounded-xl w-full max-w-sm max-h-[80vh] flex flex-col overflow-hidden">
+      <div class="flex items-center justify-between px-4 py-3 border-b border-slate-200 shrink-0">
+        <h3 class="font-semibold"><i class="fa fa-tag text-primary-500 mr-1"></i>设置科目</h3>
+        <button id="subject-modal-close" type="button" class="text-slate-400 hover:text-slate-600 transition"><i class="fa fa-times text-lg"></i></button>
+      </div>
+      <div class="flex-1 overflow-y-auto p-4">
+        <div id="subject-modal-list" class="grid grid-cols-2 gap-2"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- AI 解析弹层 -->
+  <div id="ai-modal" class="hidden fixed inset-0 z-40 bg-black/50 flex items-end sm:items-center justify-center p-4">
+    <div class="bg-white rounded-xl w-full max-w-lg max-h-[85vh] flex flex-col overflow-hidden">
+      <div class="flex items-center justify-between px-4 py-3 border-b border-slate-200 shrink-0">
+        <h3 class="font-semibold"><i class="fa fa-magic text-primary-500 mr-1"></i>AI 解析</h3>
+        <button id="ai-close" type="button" class="text-slate-400 hover:text-slate-600 transition" aria-label="关闭"><i class="fa fa-times text-lg"></i></button>
+      </div>
+      <div id="ai-content" class="flex-1 overflow-y-auto p-4 text-sm leading-relaxed text-slate-700 whitespace-pre-wrap"></div>
+      <div class="shrink-0 border-t border-slate-200 px-4 py-2 flex items-center justify-between gap-2">
+        <span class="text-[11px] text-slate-400">AI 生成，仅供参考</span>
+        <div class="flex items-center gap-2">
+          <button id="ai-to-note" type="button" class="hidden px-3 py-1.5 rounded-lg bg-primary-50 text-primary-600 text-xs font-medium hover:bg-primary-100 transition">
+            <i class="fa fa-sticky-note-o mr-1"></i>存为笔记
+          </button>
+          <button id="ai-retry" type="button" class="hidden px-3 py-1.5 rounded-lg bg-slate-100 text-slate-600 text-xs font-medium hover:bg-slate-200 transition">
+            <i class="fa fa-refresh mr-1"></i>重新生成
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="fixed bottom-6 left-1/2 -translate-x-1/2 bg-slate-800 text-white px-5 py-2.5 rounded-lg shadow-lg text-sm opacity-0 transition pointer-events-none z-50"></div>
+
+  <script src="js/bank_data.js"></script>
+  <script src="js/app.js?v=135"></script>
+</body>
+</html>

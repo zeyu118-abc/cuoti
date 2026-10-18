@@ -1,0 +1,177 @@
+button {
+  cursor: pointer;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+button:disabled {
+  cursor: not-allowed;
+  pointer-events: none;
+}
+.opt-letter,
+.review-opt,
+.list-head,
+.type-btn,
+.tab-btn {
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+
+.tab-btn {
+  color: #475569;
+}
+.tab-btn:hover {
+  background: #f1f5f9;
+}
+.tab-btn.active {
+  background: #00705f;
+  color: #fff;
+}
+
+.type-btn {
+  color: #475569;
+}
+.type-btn.active {
+  background: #00705f;
+  color: #fff;
+}
+
+.opt-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.opt-letter {
+  width: 2.25rem;
+  height: 2.25rem;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 0.5rem;
+  border: 2px solid #cbd5e1;
+  font-weight: 600;
+  cursor: pointer;
+  user-select: none;
+  transition: all 0.15s;
+  -webkit-tap-highlight-color: transparent;
+}
+.opt-letter.selected {
+  background: #00705f;
+  border-color: #00705f;
+  color: #fff;
+}
+.opt-badge {
+  width: 1.5rem;
+  height: 1.5rem;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 0.375rem;
+  background: #e2e8f0;
+  font-weight: 600;
+  font-size: 0.8rem;
+}
+.review-opt {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  padding: 0.75rem 1rem;
+  border: 2px solid #e2e8f0;
+  border-radius: 0.75rem;
+  cursor: pointer;
+  transition: all 0.15s;
+  -webkit-tap-highlight-color: transparent;
+}
+.review-opt:hover {
+  border-color: #aad9d2;
+  background: #e6f2f0;
+}
+.review-opt.selected {
+  border-color: #00705f;
+  background: #e6f2f0;
+}
+.review-opt.correct {
+  border-color: #22c55e;
+  background: #f0fdf4;
+}
+.review-opt.wrong {
+  border-color: #ef4444;
+  background: #fef2f2;
+}
+.review-opt .badge {
+  width: 1.5rem;
+  height: 1.5rem;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 0.375rem;
+  background: #e2e8f0;
+  font-weight: 600;
+  font-size: 0.8rem;
+}
+
+/* 左右边缘翻题按钮：尺寸随「内容区(max-w-4xl=896px)两侧空白」自适应，不遮挡题目 */
+.side-btn {
+  position: fixed;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 25;
+  border: none;
+  border-radius: 0.5rem;
+  background: rgba(0, 112, 95, 0.88);
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18);
+  font-weight: 600;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+  transition: transform 0.12s ease, background 0.12s ease;
+}
+.side-btn:active {
+  transform: translateY(-50%) scale(0.94);
+  background: rgba(0, 112, 95, 1);
+}
+.side-btn.hidden { display: none !important; }
+.side-label { font-size: 0.72em; line-height: 1; white-space: nowrap; }
+#prev-question, #bank-prev { left: 4px; }
+#next-question, #bank-next { right: 4px; }
+
+/* 竖屏手机：窄长条，窄不遮字、够高好点 */
+@media (orientation: portrait) and (max-width: 599px) {
+  .side-btn {
+    flex-direction: column;
+    width: 28px;
+    height: 96px;
+    font-size: 18px;
+  }
+  .side-label { display: none; }
+}
+/* 竖屏平板：比手机更收敛（更小） */
+@media (orientation: portrait) and (min-width: 600px) {
+  .side-btn {
+    flex-direction: column;
+    width: 32px;
+    height: 96px;
+    font-size: 24px;
+  }
+  .side-label { display: none; }
+}
+/* 横屏（手机/平板/电脑统一）：高度与竖屏一致，宽度随两侧空白连续自适应，无断点跳变、不遮挡题目 */
+@media (orientation: landscape) {
+  .side-btn {
+    flex-direction: row;
+    height: 96px;
+    font-size: 26px;
+    width: clamp(40px, calc((100vw - 896px) / 2 + 12px), 220px);
+  }
+  .side-label { font-size: 14px; }
+}
+/* 横屏窄窗口：按钮宽度放不下「上一题/下一题」三字时，只显示箭头不显示文字，避免换行突兀 */
+@media (orientation: landscape) and (max-width: 1099px) {
+  .side-label { display: none; }
+}
