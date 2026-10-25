@@ -99,6 +99,25 @@ button:disabled {
   border-color: #ef4444;
   background: #fef2f2;
 }
+/* 题目类型徽标：放在答对/答错（或题库分类）同一行，题干用满整行 */
+.type-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0;
+  padding: 0.3rem 0.55rem;
+  border-radius: 0.4rem;
+  color: #fff;
+  font-size: 0.75rem;
+  line-height: 1;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.16);
+}
+.type-pill.single { background: #00705f; }
+.type-pill.multiple { background: #0e7490; }
+.type-pill.judge { background: #a16207; }
+
 .review-opt .badge {
   width: 1.5rem;
   height: 1.5rem;

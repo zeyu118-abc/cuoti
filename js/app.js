@@ -24,8 +24,67 @@ const reviewQueue = [];
 let reviewIndex = 0;
 let reviewTotal = 0;  // 本次会话的首次到期题数（答题卡序号上限）
 let isBrowsing = false; // 回看模式：做完所有题后从完成页「回看今日题目」进入，最后一道不再显示「完成」
+let reviewSessionDate = ''; // 当前复习会话的日期。跨天时不能跟着系统日期变，否则会漏掉今天到期的题
+let reviewAutoTimer = null; // 复习答对后自动跳下一题的定时器
+const REVIEW_AUTO_NEXT_DELAY = 400; // 让「回答正确」先露一下，再自动跳题
+const AUTO_NEXT_KEY = 'cuoti.autoNext'; // 答对自动下一题：全局开关（复习 + 题库共用）
 
 const $ = (sel) => document.querySelector(sel);
+
+function autoNextEnabled() {
+  try {
+    const v = localStorage.getItem(AUTO_NEXT_KEY);
+    return v === null ? true : v === '1';
+  } catch (e) {
+    return true;
+  }
+}
+
+function updateAutoNextUI() {
+  const btn = $('#auto-next-toggle');
+  const stateEl = $('#auto-next-state');
+  if (!btn || !stateEl) return;
+  const on = autoNextEnabled();
+  btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+  stateEl.textContent = on ? '开' : '关';
+  stateEl.className = 'shrink-0 text-xs px-2 py-0.5 rounded-full font-medium ' +
+    (on ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-500');
+}
+
+function setAutoNextEnabled(on) {
+  try { localStorage.setItem(AUTO_NEXT_KEY, on ? '1' : '0'); } catch (e) {}
+  if (!on) {
+    clearReviewAutoTimer();
+    clearBankAutoTimer();
+  }
+  updateAutoNextUI();
+}
+
+function clearReviewAutoTimer() {
+  if (reviewAutoTimer) {
+    clearTimeout(reviewAutoTimer);
+    reviewAutoTimer = null;
+  }
+}
+
+function typeLabel(type) {
+  return type === 'multiple' ? '多选' : type === 'judge' ? '判断' : '单选';
+}
+
+// 题干左侧的题型徽标：颜色区分，字号比题目略小但加粗，保证一眼能看到
+function applyTypeBadge(el, type) {
+  if (!el) return;
+  el.textContent = typeLabel(type);
+  el.className = 'type-pill ' + (type === 'multiple' ? 'multiple' : type === 'judge' ? 'judge' : 'single');
+}
+
+// 图片压缩是异步的：用代次号丢弃「已切走/已换题」的旧结果，处理中禁止保存
+let imageFormToken = 0;
+let imageTasks = 0;
+// 长截图保护：同时限制宽度、高度和总像素，避免 canvas 超过浏览器上限或内存爆掉
+const IMAGE_MAX_PIXELS = 8 * 1024 * 1024;
+const IMAGE_MAX_HEIGHT = 8192;
+let longImageWarned = false;
 
 // ============ IndexedDB 数据层 ============
 const DB_NAME = 'cuoti';
@@ -114,7 +173,8 @@ function saveSession() {
     return;
   }
   const session = {
-    date: fmtDate(new Date()),
+    // 用会话自己的日期，不要每次保存都改成“今天”：否则跨天后旧队列会被当成今天，今天的到期题就漏了
+    date: reviewSessionDate || fmtDate(new Date()),
     index: reviewIndex,
     items: reviewQueue.map((it) => ({
       id: it.q.id,
@@ -123,6 +183,7 @@ function saveSession() {
       seq: it.seq != null ? it.seq : null,
       order: it.order || null,
       selectedAnswer: it.selectedAnswer || [],
+      prevSelected: it.prevSelected || null,
       prevState: it.prevState || null,
       labels: it.labels || null,
     })),
@@ -147,11 +208,13 @@ function restoreSession(saved, all) {
       seq: typeof s.seq === 'number' ? s.seq : null,
       order: Array.isArray(s.order) ? s.order : null,
       selectedAnswer: Array.isArray(s.selectedAnswer) ? s.selectedAnswer : [],
+      prevSelected: Array.isArray(s.prevSelected) ? s.prevSelected : null,
       prevState: s.prevState && typeof s.prevState === 'object' ? s.prevState : null,
       labels: Array.isArray(s.labels) ? s.labels : null,
     });
   }
   if (items.length === 0) return false;
+  reviewSessionDate = typeof saved.date === 'string' ? saved.date : fmtDate(new Date());
   reviewQueue.length = 0;
   reviewQueue.push(...items);
   // 恢复后重排主题目序号：无论从复习内还是从列表/详情删除题目，下次进入复习序号都保持连续
@@ -168,6 +231,7 @@ function restoreSession(saved, all) {
 // 全新会话：按每日确定顺序构建队列
 function buildFreshSession(all, today) {
   const due = orderByStage(all.filter((q) => q.next_review && q.next_review <= today));
+  reviewSessionDate = today;
   reviewQueue.length = 0;
   due.forEach((q, i) => reviewQueue.push({
     q, status: 'pending', kind: 'main', retry: false, seq: i,
@@ -217,6 +281,13 @@ function fmtDate(d) {
   const day = String(d.getDate()).padStart(2, '0');
   return `${y}-${m}-${day}`;
 }
+// 真正的日历日期校验：2026-99-99、2026-02-30 这类格式对但日期不存在的值会被拒绝
+function isRealDate(s) {
+  if (typeof s !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
+  const [y, m, d] = s.split('-').map(Number);
+  const dt = new Date(y, m - 1, d);
+  return dt.getFullYear() === y && dt.getMonth() === m - 1 && dt.getDate() === d;
+}
 function escapeHtml(s) {
   return String(s || '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
@@ -227,6 +298,12 @@ function sameSet(a, b) {
 
 // ============ Tab 切换 ============
 function switchTab(name, reload = true) {
+  // 点「录入」页签始终回到文字录入顶层，避免停留在 JSON 子界面
+  if (name === 'input') {
+    $('#input-json').classList.add('hidden');
+    $('#input-paste').classList.remove('hidden');
+    $('#json-text').value = '';
+  }
   // 离开录入页时自动清空未保存内容（文字与 JSON），并复位到「文字录入」子界面
   if (name !== 'input') {
     resetInput();
@@ -237,11 +314,17 @@ function switchTab(name, reload = true) {
   document.querySelectorAll('.tab-btn').forEach((b) => b.classList.toggle('active', b.dataset.tab === name));
   document.querySelectorAll('.tab-panel').forEach((p) => p.classList.add('hidden'));
   $('#tab-' + name).classList.remove('hidden');
+  // 切页签时关掉普通弹层；相似题确认弹层不关（它还在等用户选“跳过/仍要保存”）
+  ['#answer-sheet-modal', '#subject-modal', '#ai-modal'].forEach((sel) => {
+    const el = $(sel);
+    if (el) el.classList.add('hidden');
+  });
   // 切页签时先收起左右翻题按钮，避免 fixed 按钮在移动端残留闪烁
   $('#prev-question').classList.add('hidden');
   $('#next-question').classList.add('hidden');
   $('#bank-prev').classList.add('hidden');
   $('#bank-next').classList.add('hidden');
+  clearReviewAutoTimer();
   clearBankAutoTimer();
   if (reload) {
     if (name === 'review') loadReview().catch((e) => toast('加载失败：' + e.message, false));
@@ -251,6 +334,8 @@ function switchTab(name, reload = true) {
   window.scrollTo(0, 0);
 }
 document.querySelectorAll('.tab-btn').forEach((b) => b.addEventListener('click', () => {
+  // 有没保存的录入内容时先确认，避免手滑切页签把整道题清空
+  if (b.dataset.tab !== 'input' && isInputDirty() && !confirm('当前录入的内容还没保存，确定离开吗？')) return;
   // 用户主动点顶部页签离开子视图（详情/JSON 录入）时，丢弃遗留的返回栈，避免手机返回键乱跳
   if (backHandlers.length > 0) {
     history.go(-backHandlers.length);
@@ -263,6 +348,11 @@ document.querySelectorAll('.tab-btn').forEach((b) => b.addEventListener('click',
     listView.subject = null;
     listView.typeFilter = 'all';
     listView.page = 1;
+    listSelectMode = false;
+    selectedIds.clear();
+  }
+  // 离开错题页时退出删除模式，避免下次回来还残留勾选
+  if (b.dataset.tab !== 'list') {
     listSelectMode = false;
     selectedIds.clear();
   }
@@ -308,6 +398,7 @@ function optionTypeKey(type) {
 }
 
 function setType(type) {
+  imageFormToken++; // 选项行会重建，丢弃尚未完成的旧压缩结果
   // 先保存当前题型的选项内容，切换后再切回时能完整恢复（含 C、D）
   state.byType[optionTypeKey(state.type)] = state.options.map((o) => ({ text: o.text || '', image: o.image || '' }));
 
@@ -428,13 +519,19 @@ function renderOptions() {
         const file = fileInput.files[0];
         fileInput.value = '';
         if (!file) return;
+        const token = imageFormToken;
+        imageTasks++;
         try {
-          opt.image = await compressImage(file, 800);
-          preview.src = opt.image;
+          const data = await compressImage(file, 800);
+          if (token !== imageFormToken) return; // 表单已切换，丢弃旧结果
+          opt.image = data;
+          preview.src = data;
           preview.style.display = '';
           rmBtn.style.display = '';
         } catch (e) {
-          toast('图片处理失败：' + e.message, false);
+          if (token === imageFormToken) toast('图片处理失败：' + e.message, false);
+        } finally {
+          imageTasks--;
         }
       });
       rmBtn.addEventListener('click', () => {
@@ -540,6 +637,8 @@ function extractTrailingOption(line) {
     if (punct) {
       last = { index: m.index, end: m.index + 1 + punct[0].length, label };
     } else if (/^[^\sA-Za-zＡ-Ｚａ-ｚ]/.test(rest) || (/^[A-ZＡ-Ｚ]/.test(rest) && /^[a-dａ-ｄ]$/.test(m[0]))) {
+      // 没有标点时，如果后面是「相/线/侧/段…」或问句，更像是题干（A相短路…），不当作选项
+      if (/^[相线侧段]/.test(rest) || /[？?]/.test(rest)) continue;
       last = { index: m.index, end: m.index + 1, label };
     }
   }
@@ -632,7 +731,12 @@ function splitQuestionOptions(text) {
       return { stem, options: inline.options };
     }
     const stemLines = lines.slice(0, c.lineIdx).filter((l) => l.trim());
-    if (c.label !== 'A' || stemLines.length > 0) {
+    const rawLine = (lines[c.lineIdx] || '').trim();
+    const explicitPunct = /^[A-Da-dＡ-Ｄａ-ｄ]\s*[.、．:：)）]/.test(rawLine);
+    // 没写「A.」这种明确标点、后面又是「相/线/侧/段…」或问句时，按题干处理，避免把「A相短路…」拆成选项
+    const looksLikeStem = c.label === 'A' && !explicitPunct &&
+      (/^[相线侧段]/.test(c.text) || /[？?]/.test(c.text));
+    if (!looksLikeStem && (c.label !== 'A' || stemLines.length > 0)) {
       return { stem: stemLines.join('\n'), options: [{ label: c.label, text: c.text }] };
     }
   }
@@ -743,7 +847,8 @@ function doSplit() {
   const isJudge = optA && optB &&
     /^(正确|对|√|✓)\s*[.、。]?$/.test((optA.text || '').trim()) &&
     /^(错误|错|×|✗)\s*[.、。]?$/.test((optB.text || '').trim());
-  if (isJudge && state.type !== 'judge') {
+  // 只有“正好两个选项”才自动切判断题；四选项题里 A=正确/B=错误 不能丢 C/D
+  if (isJudge && parsed.options.length === 2 && state.type !== 'judge') {
     setType('judge');
     $('#q-text').value = parsed.stem;
     return;
@@ -768,7 +873,13 @@ $('#split-btn').addEventListener('click', doSplit);
 // ============ 图片压缩 ============
 // 把已加载的 Image 画到白底 canvas，去黑边并收缩，输出 JPEG dataURL
 function processImageBitmap(img, maxW) {
-  const scale = Math.min(1, maxW / img.width);
+  // 同时限制宽度、高度和总像素：只按宽度缩，长截图会变成几万像素高，手机 canvas 直接崩
+  const scale = Math.min(
+    1,
+    maxW / img.width,
+    IMAGE_MAX_HEIGHT / img.height,
+    Math.sqrt(IMAGE_MAX_PIXELS / (img.width * img.height))
+  );
   const w = Math.round(img.width * scale);
   const h = Math.round(img.height * scale);
   const canvas = document.createElement('canvas');
@@ -815,6 +926,10 @@ function compressImage(file, maxW = 1200) {
     reader.onload = async () => {
       try {
         const img = await loadImage(reader.result);
+        if (!longImageWarned && img.height > IMAGE_MAX_HEIGHT) {
+          longImageWarned = true;
+          toast('长截图已自动缩小，若看不清请裁成几张再上传', false);
+        }
         resolve(processImageBitmap(img, maxW));
       } catch (e) { reject(e); }
     };
@@ -944,13 +1059,19 @@ qImageFile.addEventListener('change', async () => {
   const file = qImageFile.files[0];
   qImageFile.value = '';
   if (!file) return;
+  const token = imageFormToken;
+  imageTasks++;
   try {
-    state.questionImage = await compressImage(file, 1200);
-    qImagePreview.src = state.questionImage;
+    const data = await compressImage(file, 1200);
+    if (token !== imageFormToken) return; // 表单已切换，丢弃旧结果
+    state.questionImage = data;
+    qImagePreview.src = data;
     qImagePreview.classList.remove('hidden');
     qImageRemove.classList.remove('hidden');
   } catch (e) {
-    toast('图片处理失败：' + e.message, false);
+    if (token === imageFormToken) toast('图片处理失败：' + e.message, false);
+  } finally {
+    imageTasks--;
   }
 });
 qImageRemove.addEventListener('click', () => {
@@ -965,6 +1086,7 @@ let editReturnTo = 'review';
 let editFromRedo = false;
 let savingQuestion = false; // 防止连点「保存」重复录入
 function loadQuestionToInput(q, returnTo) {
+  imageFormToken++;
   editReturnTo = returnTo || 'review';
   const cur = currentItem();
   editFromRedo = !!(cur && cur.kind === 'redo');
@@ -1006,6 +1128,7 @@ function loadQuestionToInput(q, returnTo) {
   renderSubjectSelector();
   renderOptions();
   switchTab('input');
+  markInputClean(); // 刚载入的题目算“干净”，没改过就切页签不弹确认
 }
 
 $('#save-btn').addEventListener('click', async () => {
@@ -1016,16 +1139,25 @@ $('#save-btn').addEventListener('click', async () => {
     const o = state.options[i] || {};
     return { label: l, text: (o.text || '').trim(), image: o.image || '' };
   });
+  // 快照表单状态：后面的 await 期间用户可能切页或改表单，保存应以点击「保存」那一刻为准
+  const form = {
+    editingId: state.editingId,
+    type: state.type,
+    questionImage: state.questionImage,
+    answer: Array.isArray(state.answer) ? state.answer.slice() : [],
+    subject: state.subject,
+  };
 
-  if (!qText && !state.questionImage) return toast('请填写题干或上传图片', false);
-  if (state.answer.length === 0) return toast('请选择正确答案', false);
+  if (!qText && !form.questionImage) return toast('请填写题干或上传图片', false);
+  if (form.answer.length === 0) return toast('请选择正确答案', false);
   if (options.some((o) => !o.text && !o.image)) return toast('请填写所有选项内容或上传图片', false);
+  if (imageTasks > 0) return toast('图片还在处理，请稍候再保存', false);
   if (savingQuestion) return;
 
   savingQuestion = true;
   try {
-    if (state.editingId != null) {
-      const editingId = state.editingId;
+    if (form.editingId != null) {
+      const editingId = form.editingId;
       const all = await dbGetAll();
       const original = all.find((q) => q.id === editingId);
       if (!original) {
@@ -1037,17 +1169,22 @@ $('#save-btn').addEventListener('click', async () => {
       if (original) {
         const updated = {
           ...original,
-          type: state.type,
+          type: form.type,
           question_text: qText,
-          question_image: state.questionImage,
+          question_image: form.questionImage,
           options,
-          answer: state.answer,
-          subject: state.subject,
+          answer: form.answer,
+          subject: form.subject,
           note,
         };
 
-        const answerChanged = !sameSet(original.answer || [], state.answer);
+        const answerChanged = !sameSet(original.answer || [], form.answer);
         const typeChanged = updated.type !== original.type;
+        // 这次修改前是否还有“未重做的错题重做项”；有的话，改完若仍是错题要补回来，
+        // 否则“修改题目”会把待重做悄悄删掉，可能直接跳到完成页。
+        const hadPendingRedo = reviewQueue.some(
+          (x) => x.q.id === editingId && x.kind === 'redo' && x.status === 'pending'
+        );
 
         // 找到该题在复习队列中的首次项，仅在「录入的正确答案被改动」时重新判分纠正统计
         for (let i = 0; i < reviewQueue.length; i++) {
@@ -1069,15 +1206,18 @@ $('#save-btn').addEventListener('click', async () => {
               }
             } else if (wasGraded && it.prevState && answerChanged) {
               // 把用户此前选的「显示标签」还原成真实选项标签，再和修正后的正确答案比较。
-              // labels 可能因刷新丢失，退化为按题型重建，保证还原结果一致。
+              // 优先用 prevSelected（刷新转重做时单独保存的原选择），避免 selectedAnswer 被清空后误判。
               const labelsForReal = (it.labels && it.labels.length)
                 ? it.labels
                 : (it.q.type === 'judge' ? LABELS_JUDGE : LABELS_ALL);
-              const selectedReal = (it.selectedAnswer || []).map((s) => {
+              const selectedForRegrade = (Array.isArray(it.prevSelected) && it.prevSelected.length)
+                ? it.prevSelected
+                : (it.selectedAnswer || []);
+              const selectedReal = selectedForRegrade.map((s) => {
                 const pos = labelsForReal.indexOf(s);
                 return (pos >= 0 && it.order && it.order[pos] != null) ? labelsForReal[it.order[pos]] : s;
               });
-              const nowCorrect = sameSet(selectedReal, state.answer);
+              const nowCorrect = sameSet(selectedReal, form.answer);
               const wasCorrect = it.status === 'correct';
               if (nowCorrect !== wasCorrect) {
                 regraded = nowCorrect ? 'correct' : 'wrong';
@@ -1119,6 +1259,7 @@ $('#save-btn').addEventListener('click', async () => {
                 it.selectedAnswer = [];
                 it.status = 'pending';
                 it.prevState = null; // 旧的作答统计已撤销，重新作答时按首次计数
+                it.prevSelected = null;
               } else if (regraded) {
                 it.status = regraded; // 保留用户此前选择，用于显示纠正后的判定结果
               }
@@ -1127,12 +1268,36 @@ $('#save-btn').addEventListener('click', async () => {
             }
           }
         }
+
+        // 原来有待重做、改完仍是错题：补一条新的重做项，避免“改个题干就不用重做”
+        if (hadPendingRedo) {
+          const mainItem = reviewQueue.find((x) => x.q.id === editingId && x.kind === 'main');
+          const stillHasPending = reviewQueue.some(
+            (x) => x.q.id === editingId && x.kind === 'redo' && x.status === 'pending'
+          );
+          if (mainItem && mainItem.status === 'wrong' && !stillHasPending) {
+            reviewQueue.push({
+              q: updated,
+              status: 'pending',
+              kind: 'redo',
+              retry: false,
+              seq: null,
+              order: null,
+              selectedAnswer: [],
+              prevSelected: null,
+            });
+          }
+        }
       }
       toast('已保存修改');
       resetInput();
       // 队列已在上面更新（重判分/移除错题重做），统一持久化，避免从详情页改完后复习页仍显示旧判定
       saveSession();
-      if (editReturnTo === 'detail') {
+      // 用户点保存后已经切到别的页签：只保存，不再把页面强行拉回录入/复习
+      const stillOnInput = !$('#tab-input').classList.contains('hidden');
+      if (!stillOnInput) {
+        // 不跳转
+      } else if (editReturnTo === 'detail') {
         const fresh = (await dbGetAll()).find((x) => x.id === editingId);
         if (fresh) renderDetail(fresh);
         switchTab('detail');
@@ -1150,12 +1315,12 @@ $('#save-btn').addEventListener('click', async () => {
       }
     } else {
       const newQuestion = {
-        type: state.type,
+        type: form.type,
         question_text: qText,
-        question_image: state.questionImage,
+        question_image: form.questionImage,
         options,
-        answer: state.answer,
-        subject: state.subject,
+        answer: form.answer,
+        subject: form.subject,
         note,
         notes: [],
         review_stage: 0,
@@ -1184,7 +1349,29 @@ $('#save-btn').addEventListener('click', async () => {
   }
 });
 
+// 录入表单“干净”快照：切页签前判断有没有未保存内容，避免手滑把整道题清空
+let inputSnapshot = '';
+function inputStateSignature() {
+  return JSON.stringify({
+    id: state.editingId,
+    type: state.type,
+    answer: state.answer,
+    subject: state.subject,
+    questionImage: state.questionImage,
+    options: state.options,
+    text: $('#q-text').value,
+    note: $('#q-note').value,
+  });
+}
+function markInputClean() {
+  try { inputSnapshot = inputStateSignature(); } catch (e) { inputSnapshot = ''; }
+}
+function isInputDirty() {
+  try { return inputStateSignature() !== inputSnapshot; } catch (e) { return false; }
+}
+
 function resetInput() {
+  imageFormToken++;
   state.editingId = null;
   state.type = 'single';
   state.options = [{ text: '', image: '' }, { text: '', image: '' }, { text: '', image: '' }, { text: '', image: '' }];
@@ -1203,6 +1390,7 @@ function resetInput() {
   document.querySelectorAll('.type-btn').forEach((b) => b.classList.toggle('active', b.dataset.type === 'single'));
   renderSubjectSelector();
   renderOptions();
+  markInputClean();
 }
 
 // ============ 相似题目检测 ============
@@ -1233,12 +1421,41 @@ function textSimilarity(a, b) {
   return union === 0 ? 0 : inter / union;
 }
 
+// 选项相似度：忽略选项顺序和 A/B/C/D 标签，只比较选项文字。
+// 同一题干可能被不同题目复用（例如“关于……下面描述错误的是”），
+// 只看题干会把它们误判成重复题；选项才是区分“同一道题”的关键。
+function optionSetSimilarity(a, b) {
+  const optionTexts = (q) => (Array.isArray(q.options) ? q.options : [])
+    .map((o) => normalizeText(typeof o === 'string' ? o : (o && o.text)))
+    .filter(Boolean);
+  const aa = optionTexts(a), bb = optionTexts(b);
+  // 两边都至少有两个文字选项才比较；图片选项没有文字，交给题干兜底
+  if (aa.length < 2 || bb.length < 2) return null;
+  let total = 0;
+  for (const x of aa) {
+    let best = 0;
+    for (const y of bb) {
+      const s = textSimilarity(x, y);
+      if (s > best) best = s;
+    }
+    total += best;
+  }
+  // 除以较长的一边：多出/少掉选项也要扣分
+  return total / Math.max(aa.length, bb.length);
+}
+
 function findSimilar(q, all) {
   let best = null, bestScore = 0;
   for (const existing of all) {
     // 判断与单选/多选题型不同，不可能是同一道题，直接跳过
     if ((q.type === 'judge') !== (existing.type === 'judge')) continue;
-    const score = textSimilarity(q.question_text, existing.question_text);
+    const stemScore = textSimilarity(q.question_text, existing.question_text);
+    // 题干完全不像的，不必再比选项
+    if (stemScore < 0.5) continue;
+    const optScore = optionSetSimilarity(q, existing);
+    // 题干占 40%，选项占 60%：题干相同但选项截然不同 → 0.4，不再误报；
+    // 题干略有 OCR 差异但选项高度一致 → 仍能识别为重复。
+    const score = optScore == null ? stemScore : (stemScore * 0.4 + optScore * 0.6);
     if (score > bestScore) { bestScore = score; best = existing; }
   }
   return best && bestScore >= DUP_THRESHOLD ? best : null;
@@ -1260,7 +1477,7 @@ let dupResolve = null;
 function askDuplicate(newQ, oldQ, action) {
   return new Promise((resolve) => {
     renderCompareBox($('#dup-new'), newQ, action === '导入' ? '你正在导入的题目' : '你正在录入的题目');
-    renderCompareBox($('#dup-old'), oldQ, '题库里已有的题目');
+    renderCompareBox($('#dup-old'), oldQ, '已录入的题目');
     $('#dup-keep').textContent = '不是同一题，仍要' + action;
     $('#dup-skip').textContent = action === '导入' ? '是同一题，跳过不导入' : '是同一题，取消保存';
     dupResolve = resolve;
@@ -1340,6 +1557,10 @@ async function loadReview() {
       // 刷新/重新进入复习时，若当前题已答，按「从答题卡进入」同样转成重做，方便继续作答
       const cur = currentItem();
       if (cur && cur.status !== 'pending' && cur.retry !== true) {
+        // 先把「上次实际选了什么」单独存一份，供改答案重判用；selectedAnswer 要清空才能重做
+        if (!Array.isArray(cur.prevSelected) || cur.prevSelected.length === 0) {
+          cur.prevSelected = Array.isArray(cur.selectedAnswer) ? cur.selectedAnswer.slice() : [];
+        }
         cur.retry = true;
         cur.selectedAnswer = [];
       }
@@ -1401,6 +1622,7 @@ function refreshBottomBar() {
 }
 
 function renderQuestion() {
+  clearReviewAutoTimer();
   const it = currentItem();
   if (!it) { showReviewComplete(); return; }
   const q = it.q;
@@ -1448,8 +1670,7 @@ function renderQuestion() {
   $('#review-cnt').innerHTML =
     `<span class="px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-600 font-medium">答对 ${Number(q.correct_count) || 0} 次</span>` +
     `<span class="px-2 py-0.5 rounded-full bg-red-50 text-red-600 font-medium">答错 ${Number(q.wrong_count) || 0} 次</span>`;
-  $('#review-type-badge').textContent =
-    q.type === 'single' ? '单选题' : q.type === 'multiple' ? '多选题' : '判断题';
+  applyTypeBadge($('#review-type-badge'), q.type);
   // 仅未归类（无科目）的题显示设置科目图标，已归类的不再显示；题库题（bank_id）固定归行测，不给改科目
   $('#review-subject-btn').classList.toggle('hidden', SUBJECTS.includes(q.subject) || q.bank_id != null);
 
@@ -1608,9 +1829,13 @@ function createNoteItem(q, n, onSaved) {
       const t = ta.value.trim();
       if (!t) deleteNoteEntry(q, n);
       else updateNoteEntry(q, n, t);
-      await dbPut(q);
-      toast(t ? '笔记已保存' : '笔记已删除');
-      onSaved();
+      try {
+        await dbPut(q);
+        toast(t ? '笔记已保存' : '笔记已删除');
+        onSaved();
+      } catch (e) {
+        toast('保存失败：' + e.message, false);
+      }
     });
     cancelBtn.addEventListener('click', () => onSaved());
     ta.focus();
@@ -1621,9 +1846,13 @@ function createNoteItem(q, n, onSaved) {
     e.stopPropagation();
     if (!confirm('删除这条笔记？')) return;
     deleteNoteEntry(q, n);
-    await dbPut(q);
-    toast('笔记已删除');
-    onSaved();
+    try {
+      await dbPut(q);
+      toast('笔记已删除');
+      onSaved();
+    } catch (err) {
+      toast('删除失败：' + err.message, false);
+    }
   });
 
   return item;
@@ -1654,13 +1883,15 @@ function daysBetween(a, b) {
 
 function reviewNextHint(q) {
   if (!q.next_review) return '已掌握，无需再复习';
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(q.next_review)) return '下次复习日期有误，请修改题目后重新保存';
+  if ((Number(q.review_stage) || 0) >= MASTER_STAGE) return '已掌握，无需再复习';
+  if (!isRealDate(q.next_review)) return '下次复习日期有误，请修改题目后重新保存';
   const days = daysBetween(fmtDate(new Date()), q.next_review);
   if (days <= 0) return '将在今天复习';
   return `将在 ${days} 天后复习（${q.next_review}）`;
 }
 
 async function showReviewComplete() {
+  clearReviewAutoTimer();
   let all;
   try {
     all = await dbGetAll();
@@ -1674,6 +1905,13 @@ async function showReviewComplete() {
   const doneAll = all.filter((q) => q.last_reviewed);
   const correctAll = doneAll.filter((q) => q.last_result === 'correct').length;
   const pct = (c, t) => (t === 0 ? 0 : Math.round((c / t) * 100));
+
+  // 题目被删光（比如唯一一题答对后删掉）时，别显示“今日做题 0 道”的奖杯页，回到普通空状态
+  if (doneAll.length === 0 && reviewQueue.length === 0) {
+    saveSession();
+    showReviewIdle();
+    return;
+  }
 
   $('#review-box').classList.add('hidden');
   $('#review-empty').classList.remove('hidden');
@@ -1699,7 +1937,12 @@ async function showReviewComplete() {
   $('#review-again-btn').addEventListener('click', async () => {
     let mainItems = reviewQueue.filter((x) => x.kind === 'main');
     if (mainItems.length === 0) {
-      const all = await dbGetAll();
+      let all;
+      try {
+        all = await dbGetAll();
+      } catch (e) {
+        return toast('加载失败：' + e.message, false);
+      }
       const today2 = fmtDate(new Date());
       const byId = new Map(all.map((q) => [q.id, q]));
       // 优先从保存的会话恢复今日完整题目顺序；否则从数据库按今天做过的题兜底
@@ -1728,6 +1971,7 @@ async function showReviewComplete() {
             kind: 'main', retry: false, seq: i, order: null, selectedAnswer: [],
           }));
       }
+      reviewSessionDate = today2; // 这批回看题是今天的，会话日期跟着今天
     }
     if (mainItems.length === 0) return toast('今天还没有做题记录', false);
     isBrowsing = true;
@@ -1782,12 +2026,21 @@ function renderAnsweredState(it) {
   updateAiVisibility();
 }
 
-$('#submit-answer').addEventListener('click', async () => {
+let answerSubmitting = false; // 防止连点提交/写库期间重复判分
+// 提交/判分期间锁住选项，避免写库还没完成时改选，导致“判分用旧选择、画面用新选择”
+function setReviewOptionsLocked(locked) {
+  document.querySelectorAll('#review-options .review-opt').forEach((el) => {
+    el.style.pointerEvents = locked ? 'none' : '';
+  });
+}
+async function submitCurrentAnswer() {
+  clearReviewAutoTimer();
   const it = currentItem();
   if (!it) return;
   if ((it.selectedAnswer || []).length === 0) return toast('请先选择答案', false);
   if (it.status !== 'pending' && it.retry !== true) return;
 
+  setReviewOptionsLocked(true);
   const correct = sameSet(it.selectedAnswer, it.currentAnswer);
   const isManualRetry = it.retry === true;
   const isFirstAttempt = it.kind === 'main' && !isManualRetry;
@@ -1820,11 +2073,14 @@ $('#submit-answer').addEventListener('click', async () => {
     try {
       await dbPut({ ...q, ...changes });
     } catch (e) {
+      setReviewOptionsLocked(false);
       toast('保存失败：' + e.message, false);
       return;
     }
     Object.assign(q, changes);
     it.prevState = prevState;
+    // 这一轮重新开始，之前的“上次选择”已失效；重做时 enterRedo 会重新记
+    it.prevSelected = null;
   }
 
   it.status = correct ? 'correct' : 'wrong';
@@ -1832,37 +2088,81 @@ $('#submit-answer').addEventListener('click', async () => {
 
   // 做错：除「答题卡手动重做」外，都追加到队尾再练一次，直到做对
   if (!correct && !isManualRetry) {
-    reviewQueue.push({ q: it.q, status: 'pending', kind: 'redo', retry: false });
+    reviewQueue.push({ q: it.q, status: 'pending', kind: 'redo', retry: false, selectedAnswer: [], prevSelected: null });
   }
 
   updateReviewStats();
   refreshBadge();
-  renderAnsweredState(it);
+  // 写库期间用户可能已翻到别的题，只在当前仍是这道题时才渲染结果，避免把旧结果画到新题上
+  if (currentItem() === it) renderAnsweredState(it);
   saveSession();
+  if (currentItem() === it && it.status === 'correct') scheduleReviewAutoNext();
+}
+
+$('#submit-answer').addEventListener('click', async () => {
+  if (answerSubmitting) return;
+  answerSubmitting = true;
+  try {
+    await submitCurrentAnswer();
+  } finally {
+    answerSubmitting = false;
+  }
 });
 
-$('#next-question').addEventListener('click', () => {
+// 「下一题 / 完成」与自动快进共用同一条路径，避免两套逻辑走岔
+function advanceReview() {
+  clearReviewAutoTimer();
   const n = reviewQueue.length;
   if (n === 0) return;
 
-  // 下一题：线性前进；到末尾后回到第一个未做题（含被跳过的），否则进入完成页
-  const next = reviewIndex + 1;
-  if (next < n) {
-    reviewIndex = next;
-    renderQuestion();
-    updateReviewStats();
+  // 回看模式：按顺序浏览已做过的题
+  if (isBrowsing) {
+    if (reviewIndex + 1 < n) {
+      reviewIndex += 1;
+      renderQuestion();
+      updateReviewStats();
+    }
     return;
   }
-  const firstPending = reviewQueue.findIndex((x) => x.status === 'pending');
-  if (firstPending >= 0) {
-    reviewIndex = firstPending;
+
+  // 正常复习：只跳到下一道“未做”的题，不落在已判分的题上。
+  // 否则错题重做做完一遍后，可能停在一条旧的错误记录上，看到的还是上次的错误界面。
+  let next = -1;
+  for (let i = reviewIndex + 1; i < n; i++) {
+    if (reviewQueue[i].status === 'pending') { next = i; break; }
+  }
+  if (next < 0) next = reviewQueue.findIndex((x) => x.status === 'pending');
+  if (next >= 0) {
+    reviewIndex = next;
     renderQuestion();
     updateReviewStats();
   } else {
     showReviewComplete();
     updateReviewStats();
   }
-});
+}
+
+// 答对后延迟跳题：只在当前仍是这道刚答对的题、且还有未做题时执行；
+// 任何手动翻题/答题卡/笔记/编辑/切页签都会 clearReviewAutoTimer，避免“定时器追着人跳”。
+function scheduleReviewAutoNext() {
+  clearReviewAutoTimer();
+  if (!autoNextEnabled()) return;
+  if (!reviewQueue.some((x) => x.status === 'pending')) return;
+  const it = currentItem();
+  if (!it || it.status !== 'correct') return;
+  reviewAutoTimer = setTimeout(() => {
+    reviewAutoTimer = null;
+    if (!autoNextEnabled()) return;
+    const cur = currentItem();
+    if (!cur || cur.status !== 'correct') return;
+    if ($('#review-box').classList.contains('hidden')) return;
+    if (!$('#answer-sheet-modal').classList.contains('hidden')) return;
+    if (!$('#ai-modal').classList.contains('hidden')) return;
+    advanceReview();
+  }, REVIEW_AUTO_NEXT_DELAY);
+}
+
+$('#next-question').addEventListener('click', advanceReview);
 
 $('#prev-question').addEventListener('click', () => {
   const it = reviewQueue[reviewIndex];
@@ -1881,6 +2181,10 @@ $('#prev-question').addEventListener('click', () => {
 // ============ 答题卡 ============
 function enterRedo(index) {
   const it = reviewQueue[index];
+  // 保留上次判分时的选择，之后若改答案，重判才能按“当时真实选了什么”来算
+  if (!Array.isArray(it.prevSelected) || it.prevSelected.length === 0) {
+    it.prevSelected = Array.isArray(it.selectedAnswer) ? it.selectedAnswer.slice() : [];
+  }
   it.retry = true;
   it.selectedAnswer = [];
   reviewIndex = index;
@@ -1891,22 +2195,20 @@ function renderAnswerSheet() {
   const grid = $('#answer-sheet-grid');
   grid.innerHTML = '';
 
-  const pendingMain = pendingMainCount();
-  const pendingRedo = pendingRedoCount();
-
-  // 主复习阶段（还有未做主题目）或回看（全部已做完）：显示主题目答题卡；错题重做阶段单独一张
-  const inRedoPhase = pendingMain === 0 && pendingRedo > 0;
+  // 以“当前正在看的题”判断阶段：最后一题刚答完、还没点下一题时，仍显示主答题卡；
+  // 只有真的在错题重做题上，才切到「错题重做」卡。
+  const cur = currentItem();
+  const inRedoPhase = !!cur && cur.kind === 'redo';
 
   if (inRedoPhase) {
-    // 错题重做答题卡：显示待重做错题，序号沿用原题号，绿=已重做对 红=仍错 灰=待重做
+    // 错题重做答题卡：按队列顺序列出每一次重做（同一题反复做错会有多条），
+    // 序号 1、2、3… 每次做错都在最后新增一个序号，绿=对 红=错 灰=未做。
     $('#answer-sheet-title').textContent = '错题重做';
-    const mainSeqMap = new Map();
-    reviewQueue.forEach((x) => { if (x.kind === 'main') mainSeqMap.set(x.q, x.seq); });
     const items = reviewQueue.filter((x) => x.kind === 'redo');
-    items.forEach((it) => {
+    items.forEach((it, i) => {
       const btn = document.createElement('button');
       btn.type = 'button';
-      btn.textContent = (mainSeqMap.get(it.q) != null ? mainSeqMap.get(it.q) : 0) + 1;
+      btn.textContent = i + 1;
       if (it.status === 'correct') btn.className = 'h-11 rounded-lg font-semibold text-sm bg-green-500 text-white';
       else if (it.status === 'wrong') btn.className = 'h-11 rounded-lg font-semibold text-sm bg-red-500 text-white';
       else btn.className = 'h-11 rounded-lg font-semibold text-sm bg-slate-200 text-slate-500';
@@ -1944,6 +2246,7 @@ function renderAnswerSheet() {
 }
 
 $('#answer-sheet-btn').addEventListener('click', () => {
+  clearReviewAutoTimer();
   renderAnswerSheet();
   $('#answer-sheet-modal').classList.remove('hidden');
 });
@@ -1960,9 +2263,17 @@ function exitBrowse() {
 // 从今日复习队列移除某题（首次 + 错题重做），并重排主题目序号。
 // 复习内删除、列表/详情删除共用，避免删除后红圈与待复习数暂不一致。
 function removeQuestionFromQueue(qid) {
+  let removedBeforeCurrent = 0;
   for (let i = reviewQueue.length - 1; i >= 0; i--) {
-    if (reviewQueue[i].q.id === qid) reviewQueue.splice(i, 1);
+    if (reviewQueue[i].q.id === qid) {
+      // 删掉当前题之前的题，当前题的下标会前移，这里同步减掉，避免回复习时跳过一道题
+      if (i < reviewIndex) removedBeforeCurrent++;
+      reviewQueue.splice(i, 1);
+    }
   }
+  if (removedBeforeCurrent > 0) reviewIndex = Math.max(0, reviewIndex - removedBeforeCurrent);
+  if (reviewQueue.length === 0) reviewIndex = 0;
+  else if (reviewIndex >= reviewQueue.length) reviewIndex = reviewQueue.length - 1;
   reviewQueue
     .filter((x) => x.kind === 'main')
     .sort((a, b) => (a.seq || 0) - (b.seq || 0))
@@ -1977,6 +2288,7 @@ $('#review-back').addEventListener('click', () => {
 });
 
 $('#review-delete').addEventListener('click', async () => {
+  clearReviewAutoTimer();
   const it = currentItem();
   if (!it) return;
   if (!confirm('确定删除这道题吗？')) return;
@@ -2003,6 +2315,7 @@ $('#review-delete').addEventListener('click', async () => {
 
 // ============ 复习中：添加笔记 / 修改题目 ============
 $('#review-note-btn').addEventListener('click', () => {
+  clearReviewAutoTimer();
   $('#review-note-text').value = '';
   $('#review-note-editor').classList.remove('hidden');
   $('#review-note-btn').classList.add('hidden');
@@ -2035,11 +2348,13 @@ $('#review-note-save').addEventListener('click', async () => {
 });
 
 $('#review-edit-btn').addEventListener('click', () => {
+  clearReviewAutoTimer();
   const q = currentItem().q;
   loadQuestionToInput(q);
 });
 
 $('#review-subject-btn').addEventListener('click', () => {
+  clearReviewAutoTimer();
   const it = currentItem();
   if (!it) return;
   openSubjectModal(it.q, 'review');
@@ -2107,7 +2422,6 @@ async function loadList() {
       .sort((a, b) => (b.id || 0) - (a.id || 0))
       .filter(matchListFilter);
     $('#list-search-clear').classList.toggle('hidden', !listKeyword);
-    $('#sub-view-title').textContent = `行测 · ${fullList.length} 题`;
   } else if (listView.mode === 'subject') {
     // 某科目错题：仅显示该科目的手动录入题
     fullList = all
@@ -2115,14 +2429,21 @@ async function loadList() {
       .sort((a, b) => (b.id || 0) - (a.id || 0))
       .filter(matchListFilter);
     $('#list-search-clear').classList.toggle('hidden', !listKeyword);
-    $('#sub-view-title').textContent = `${listView.subject} · ${fullList.length} 题`;
+  } else if (listKeyword) {
+    // 搜索时跨全部错题（未分类 + 各科目 + 行测），避免带科目标签的题搜不到
+    fullList = all
+      .slice()
+      .sort((a, b) => (b.id || 0) - (a.id || 0))
+      .filter(matchListFilter);
+    $('#list-search-clear').classList.remove('hidden');
+    renderSubjectEntries(all);
+    renderBankEntryCount(all);
   } else {
     // 默认：仅显示未分类的手动录入题，带科目的题进对应科目入口
     fullList = all
       .filter((q) => q.bank_id == null && !SUBJECTS.includes(q.subject))
-      .sort((a, b) => (b.id || 0) - (a.id || 0))
-      .filter(matchListFilter);
-    $('#list-search-clear').classList.toggle('hidden', !listKeyword);
+      .sort((a, b) => (b.id || 0) - (a.id || 0));
+    $('#list-search-clear').classList.add('hidden');
     renderSubjectEntries(all);
     renderBankEntryCount(all);
   }
@@ -2130,6 +2451,11 @@ async function loadList() {
   // 题型筛选
   if (listView.typeFilter !== 'all') {
     fullList = fullList.filter((q) => q.type === listView.typeFilter);
+  }
+  // 子视图标题的题数放在题型筛选之后，别出现“标题 100 题、列表 60 题”
+  if (isSub) {
+    const subLabel = listView.mode === 'bank' ? '行测' : listView.subject;
+    $('#sub-view-title').textContent = `${subLabel} · ${fullList.length} 题`;
   }
 
   // 分页
@@ -2150,11 +2476,16 @@ async function loadList() {
     ? all.filter((q) => q.bank_id == null).length
     : fullList.length;
   renderListCards(pageList);
-  $('#list-empty-text').textContent =
-    listView.mode === 'bank' ? '还没有行测错题'
-    : listView.mode === 'subject' ? `还没有「${listView.subject}」错题`
-    : '还没有录入错题';
-  $('#list-empty').classList.toggle('hidden', pageList.length > 0);
+  let emptyText = '';
+  if (listKeyword) emptyText = '没有找到匹配的题目';
+  else if (listView.typeFilter !== 'all') emptyText = '没有符合筛选的题目';
+  else if (listView.mode === 'bank') emptyText = '还没有行测错题';
+  else if (listView.mode === 'subject') emptyText = `还没有「${listView.subject}」错题`;
+  else if (all.length === 0) emptyText = '还没有录入错题';
+  // 主列表只显示未分类题：如果题目都已归入科目/行测，不显示“没有未分类题”的提示，
+  // 避免用户误以为题目丢了；科目入口本身已经说明了题目在哪。
+  $('#list-empty-text').textContent = emptyText;
+  $('#list-empty').classList.toggle('hidden', pageList.length > 0 || !emptyText);
 
   $('#batch-bar').classList.toggle('hidden', !listSelectMode);
   $('#batch-btn').innerHTML = listSelectMode
@@ -2184,7 +2515,7 @@ function renderListCards(list) {
           <p class="text-sm font-medium whitespace-pre-wrap">${escapeHtml(q.question_text) || '（图片题）'}</p>
         </div>
         <div class="flex items-center gap-3 shrink-0">
-          ${listSelectMode ? '' : `${listView.mode === 'all' ? `<button class="subject-btn text-slate-400 hover:text-primary-500 transition" data-id="${q.id}" title="设置科目"><i class="fa fa-tag"></i></button>` : ''}<i class="fa fa-chevron-right text-slate-400 text-sm"></i><button class="del-btn text-slate-400 hover:text-red-500 transition" data-id="${q.id}" title="删除"><i class="fa fa-trash-o"></i></button>`}
+          ${listSelectMode ? '' : `${listView.mode === 'all' && q.bank_id == null ? `<button class="subject-btn text-slate-400 hover:text-primary-500 transition" data-id="${q.id}" title="设置科目"><i class="fa fa-tag"></i></button>` : ''}<i class="fa fa-chevron-right text-slate-400 text-sm"></i><button class="del-btn text-slate-400 hover:text-red-500 transition" data-id="${q.id}" title="删除"><i class="fa fa-trash-o"></i></button>`}
         </div>
       </div>
     `;
@@ -2410,12 +2741,20 @@ $('#batch-btn').addEventListener('click', () => {
   if (listSelectMode) window.scrollTo(0, 0);
 });
 
+// 搜索防抖：每敲一个字都全量读库会卡，等 250ms 再查
+let listSearchTimer = null;
 $('#list-search').addEventListener('input', (e) => {
   listKeyword = e.target.value.trim();
   listView.page = 1;
-  loadList();
+  clearTimeout(listSearchTimer);
+  listSearchTimer = setTimeout(() => {
+    listSearchTimer = null;
+    loadList();
+  }, 250);
 });
 $('#list-search-clear').addEventListener('click', () => {
+  clearTimeout(listSearchTimer);
+  listSearchTimer = null;
   listKeyword = '';
   $('#list-search').value = '';
   listView.page = 1;
@@ -2533,9 +2872,9 @@ document.addEventListener('click', (e) => {
 function renderDetail(q) {
   const answerList = Array.isArray(q.answer) ? q.answer : [];
   const optionList = Array.isArray(q.options) ? q.options : [];
-  const typeText = q.type === 'single' ? '单选题' : q.type === 'multiple' ? '多选题' : '判断题';
-  const mastered = !q.next_review; // 已掌握 = 无下次复习日期
+  const typeText = q.type === 'single' ? '单选' : q.type === 'multiple' ? '多选' : '判断';
   const stageNum = Math.max(0, Math.min(Number(q.review_stage) || 0, MASTER_STAGE));
+  const mastered = !q.next_review || stageNum >= MASTER_STAGE; // 已掌握 = 无日期，或已到第 6 轮
   const stageText = mastered ? '已掌握' : `第 ${stageNum + 1} 轮复习`;
   const nextText = mastered ? '—' : escapeHtml(String(q.next_review));
 
@@ -2651,19 +2990,35 @@ $('#back-to-list').addEventListener('click', () => {
 });
 
 // ============ 导出 / 导入备份 ============
+let importBusy = false; // 导入进行中，防止重复触发导致相似题弹窗互相覆盖
+
+function setBackupMenuOpen(open) {
+  $('#backup-menu').classList.toggle('hidden', !open);
+  $('#backup-btn').setAttribute('aria-expanded', open ? 'true' : 'false');
+}
+
 // header 右上角齿轮菜单
 $('#backup-btn').addEventListener('click', (e) => {
   e.stopPropagation();
-  $('#backup-menu').classList.toggle('hidden');
+  clearReviewAutoTimer();
+  clearBankAutoTimer();
+  setBackupMenuOpen($('#backup-menu').classList.contains('hidden'));
 });
 document.addEventListener('click', (e) => {
   if (!e.target.closest('#backup-btn') && !e.target.closest('#backup-menu')) {
-    $('#backup-menu').classList.add('hidden');
+    setBackupMenuOpen(false);
   }
 });
 
+$('#auto-next-toggle').addEventListener('click', (e) => {
+  e.stopPropagation();
+  const next = !autoNextEnabled();
+  setAutoNextEnabled(next);
+  toast(next ? '已开启：答对自动下一题' : '已关闭：答对后停在当前题');
+});
+
 $('#export-btn').addEventListener('click', async () => {
-  $('#backup-menu').classList.add('hidden');
+  setBackupMenuOpen(false);
   try {
     const all = await dbGetAll();
     if (all.length === 0) return toast('暂无数据可导出', false);
@@ -2684,13 +3039,15 @@ $('#export-btn').addEventListener('click', async () => {
 });
 
 $('#import-btn').addEventListener('click', () => {
-  $('#backup-menu').classList.add('hidden');
+  setBackupMenuOpen(false);
   $('#import-file').click();
 });
 $('#import-file').addEventListener('change', async () => {
   const files = Array.from($('#import-file').files || []);
   $('#import-file').value = ''; // 立即清空，允许再次选择同一个文件重试
   if (!files.length) return;
+  if (importBusy) return toast('正在导入，请稍候', false);
+  importBusy = true;
 
   let total = 0, skipped = 0, failed = 0;
   try {
@@ -2752,11 +3109,14 @@ $('#import-file').addEventListener('change', async () => {
     refreshBadge();
   } catch (e) {
     toast('导入失败：' + e.message, false);
+  } finally {
+    importBusy = false;
   }
 });
 
 // ============ JSON 录入 ============
 $('#to-json-input').addEventListener('click', () => {
+  if (isInputDirty() && !confirm('切换到 JSON 录入会清空当前正在录入的内容，确定吗？')) return;
   pushBack(() => {
     $('#input-json').classList.add('hidden');
     $('#input-paste').classList.remove('hidden');
@@ -2857,33 +3217,39 @@ $('#copy-prompt-btn').addEventListener('click', async () => {
 async function importJsonArray(arr) {
   if (!Array.isArray(arr)) throw new Error('JSON 顶层必须是数组 [ ... ]');
   if (arr.length === 0) throw new Error('没有题目');
-  let ok = 0, fail = 0, skipped = 0;
-  const existing = await dbGetAll();
-  for (let i = 0; i < arr.length; i++) {
-    try {
-      const q = normalizeQuestion(arr[i], i);
-      await processQuestionImages(q);
-      const similar = findSimilar(q, existing);
-      if (similar) {
-        const keep = await askDuplicate(q, similar, '导入');
-        if (!keep) { skipped++; continue; }
+  if (importBusy) throw new Error('正在导入，请稍候');
+  importBusy = true;
+  try {
+    let ok = 0, fail = 0, skipped = 0;
+    const existing = await dbGetAll();
+    for (let i = 0; i < arr.length; i++) {
+      try {
+        const q = normalizeQuestion(arr[i], i);
+        await processQuestionImages(q);
+        const similar = findSimilar(q, existing);
+        if (similar) {
+          const keep = await askDuplicate(q, similar, '导入');
+          if (!keep) { skipped++; continue; }
+        }
+        await dbAdd(q);
+        existing.push(q);
+        ok++;
+      } catch (e) {
+        fail++;
+        console.warn('第 ' + (i + 1) + ' 题跳过：' + e.message);
       }
-      await dbAdd(q);
-      existing.push(q);
-      ok++;
-    } catch (e) {
-      fail++;
-      console.warn('第 ' + (i + 1) + ' 题跳过：' + e.message);
     }
-  }
-  if (ok > 0) {
-    toast('成功录入 ' + ok + ' 题' + (skipped > 0 ? '，跳过重复 ' + skipped + ' 题' : '') + (fail > 0 ? '，失败 ' + fail + ' 题' : ''));
-    loadList();
-    refreshBadge();
-  } else if (skipped > 0) {
-    toast('全部为重复题目，已跳过', false);
-  } else {
-    toast('没有成功录入任何题目，请检查格式', false);
+    if (ok > 0) {
+      toast('成功录入 ' + ok + ' 题' + (skipped > 0 ? '，跳过重复 ' + skipped + ' 题' : '') + (fail > 0 ? '，失败 ' + fail + ' 题' : ''));
+      loadList();
+      refreshBadge();
+    } else if (skipped > 0) {
+      toast('全部为重复题目，已跳过', false);
+    } else {
+      toast('没有成功录入任何题目，请检查格式', false);
+    }
+  } finally {
+    importBusy = false;
   }
 }
 
@@ -3067,7 +3433,14 @@ function sanitizeBackupQuestion(raw) {
   let type = typeof raw.type === 'string' ? raw.type.trim() : '';
   type = TYPE_MAP[type] || type.toLowerCase();
   if (!['single', 'multiple', 'judge'].includes(type)) {
-    type = (Array.isArray(raw.answer) && raw.answer.length >= 2) ? 'multiple' : 'single';
+    // 备份里缺 type 时，先认“两个选项且是正确/错误”的判断题，别按单选处理导致缺 C/D 报错
+    const opts = Array.isArray(raw.options) ? raw.options : [];
+    const looksJudge = opts.length === 2 &&
+      /^(正确|对|√|✓)$/.test(optionTextOf(opts[0])) &&
+      /^(错误|错|×|✗)$/.test(optionTextOf(opts[1]));
+    type = looksJudge
+      ? 'judge'
+      : ((Array.isArray(raw.answer) && raw.answer.length >= 2) ? 'multiple' : 'single');
   }
   const labels = type === 'judge' ? LABELS_JUDGE : LABELS_ALL;
 
@@ -3128,13 +3501,18 @@ function sanitizeBackupQuestion(raw) {
   const review_stage = Number.isFinite(stageNum)
     ? Math.max(0, Math.min(MASTER_STAGE, Math.trunc(stageNum)))
     : 0;
-  const dateRe = /^\d{4}-\d{2}-\d{2}$/;
   let next_review;
-  if (raw.next_review === '') next_review = '';
-  else if (typeof raw.next_review === 'string' && dateRe.test(raw.next_review)) next_review = raw.next_review;
-  else next_review = review_stage >= MASTER_STAGE
-    ? ''
-    : fmtDate(addDays(new Date(), INTERVALS[Math.min(review_stage, INTERVALS.length - 1)]));
+  if (review_stage >= MASTER_STAGE) {
+    // 已掌握：必须没有下次复习日期，兼容 stage=6 但带了日期的旧/坏数据
+    next_review = '';
+  } else if (raw.next_review === '') {
+    // 轮次还没到 6 却给空日期：这是“没安排复习”，按当前轮次补一个，别当成已掌握
+    next_review = fmtDate(addDays(new Date(), INTERVALS[Math.min(review_stage, INTERVALS.length - 1)]));
+  } else if (isRealDate(raw.next_review)) {
+    next_review = raw.next_review;
+  } else {
+    next_review = fmtDate(addDays(new Date(), INTERVALS[Math.min(review_stage, INTERVALS.length - 1)]));
+  }
 
   const count = (v) => {
     const n = Number(v);
@@ -3163,7 +3541,7 @@ function sanitizeBackupQuestion(raw) {
     next_review,
     correct_count: count(raw.correct_count),
     wrong_count: count(raw.wrong_count),
-    last_reviewed: typeof raw.last_reviewed === 'string' && dateRe.test(raw.last_reviewed) ? raw.last_reviewed : '',
+    last_reviewed: isRealDate(raw.last_reviewed) ? raw.last_reviewed : '',
     last_result: raw.last_result === 'correct' || raw.last_result === 'wrong' ? raw.last_result : '',
     created_at: typeof raw.created_at === 'string' && raw.created_at ? raw.created_at : new Date().toISOString(),
   };
@@ -3189,6 +3567,8 @@ function refreshBadge() {
       apply(saved.items.filter((x) => x && x.status === 'pending' && x.kind !== 'redo').length);
     } else {
       dbGetAll().then((all) => {
+        // 查询期间可能已经进入复习会话，此时以会话剩余题数为准，避免旧结果覆盖红圈
+        if (reviewQueue.length > 0) { apply(pendingMainCount()); return; }
         const due = all.filter((q) => q.next_review && q.next_review <= today).length;
         apply(due);
       }).catch(() => {});
@@ -3231,7 +3611,14 @@ const BANK_AUTO_NEXT_DELAY = 200; // 做对后停留时长(ms)，短于手动点
 function loadBankProgress() {
   try {
     const v = JSON.parse(localStorage.getItem(BANK_PROGRESS_KEY));
-    return (v && typeof v === 'object' && !Array.isArray(v)) ? v : {};
+    if (!v || typeof v !== 'object' || Array.isArray(v)) return {};
+    // 只保留合法分类 + 非负整数：损坏的负数/字符串/对象不再显示成“已刷到第 -2 题”
+    const clean = {};
+    Object.keys(v).forEach((k) => {
+      const n = Number(v[k]);
+      if (BANK_CATS.includes(k) && Number.isInteger(n) && n >= 0) clean[k] = n;
+    });
+    return clean;
   } catch (e) { return {}; }
 }
 
@@ -3276,6 +3663,8 @@ function bankCatCount(category) {
 
 function renderBankCategories() {
   clearBankAutoTimer();
+  // 从刷题/答题卡退回分类页时，把答题卡弹层一起关掉，避免它盖在分类页上继续改隐藏状态
+  $('#answer-sheet-modal').classList.add('hidden');
   $('#bank-quiz').classList.add('hidden');
   $('#bank-categories').classList.remove('hidden');
   const progress = loadBankProgress();
@@ -3321,8 +3710,8 @@ function startBankQuiz(category) {
       : { status: null, selected: [] };
   });
   const p = loadBankProgress()[category];
-  let idx = (p == null || p >= bankList.length) ? 0 : p;
-  // 已刷完（p 为总题数）重新进入：从新一轮从头开始，重置进度
+  // 进度损坏（负数/非整数）或已刷完时，都从第一题开始
+  const idx = (Number.isInteger(p) && p >= 0 && p < bankList.length) ? p : 0;
   if (p != null && p >= bankList.length) saveBankProgress(category, 0);
   bankIndex = idx;
   // 进入后当前题重做：重置为未答，不管上次对错（历史对错仍保留在答题卡其他题上）
@@ -3339,15 +3728,19 @@ function startBankQuiz(category) {
 }
 
 function renderBankQuestion() {
+  clearBankAutoTimer();
   const q = bankList[bankIndex];
   if (!q) return;
   const item = bankItems[bankIndex];
   const answered = item && item.status !== null;
 
   $('#bank-progress').textContent = `第 ${bankIndex + 1} / ${bankList.length} 题`;
-  $('#bank-type-badge').innerHTML =
-    `<span class="px-2 py-0.5 rounded-full bg-primary-50 text-primary-600 font-medium">${bankCategory}</span>` +
-    `<span class="px-2 py-0.5 rounded-full bg-slate-100 font-medium">${q.type === 'single' ? '单选题' : q.type === 'multiple' ? '多选题' : '判断题'}</span>`;
+  const catBadge = $('#bank-category-badge');
+  if (catBadge) {
+    catBadge.textContent = bankCategory || '';
+    catBadge.className = 'px-2 py-0.5 rounded-full bg-primary-50 text-primary-600 font-medium';
+  }
+  applyTypeBadge($('#bank-type-badge'), q.type);
   $('#bank-question').textContent = q.question_text || '';
 
   renderBankOptions(q, answered ? item.selected : []);
@@ -3370,6 +3763,7 @@ function renderBankOptions(q, selected) {
     const div = document.createElement('div');
     div.className = 'review-opt' + (selected.includes(opt.label) ? ' selected' : '');
     div.dataset.label = opt.label;
+    div.style.pointerEvents = answered ? 'none' : ''; // 已判分就锁住，避免事后改选造成“判分和画面对不上”
     div.innerHTML = `<span class="badge">${escapeHtml(opt.label)}</span><span class="flex-1 min-w-0"><div>${escapeHtml(opt.text || '')}</div></span>`;
     if (!answered) {
       div.addEventListener('click', () => {
@@ -3400,6 +3794,7 @@ function renderBankAnsweredState() {
     el.classList.remove('correct', 'wrong');
     if (answerSet.has(label)) el.classList.add('correct');
     if (item.selected.includes(label) && !answerSet.has(label)) el.classList.add('wrong');
+    el.style.pointerEvents = 'none';
   });
   const result = $('#bank-result');
   result.classList.remove('hidden');
@@ -3463,13 +3858,16 @@ function clearBankAutoTimer() {
 
 function scheduleAutoNext() {
   clearBankAutoTimer();
+  if (!autoNextEnabled()) return;
   bankAutoTimer = setTimeout(() => {
     bankAutoTimer = null;
+    if (!autoNextEnabled()) return;
     bankNext();
   }, BANK_AUTO_NEXT_DELAY);
 }
 
 function bankSubmit() {
+  clearBankAutoTimer();
   const item = bankItems[bankIndex];
   if (!item || item.status !== null) return;
   if (item.selected.length === 0) return toast('请先选择答案', false);
@@ -3625,6 +4023,17 @@ function hashText(str) {
   return (h >>> 0).toString(36);
 }
 
+// 只接受压缩后的本地位图或 http(s) 图片；其他格式/超大图片不带给 AI
+function aiImageValue(img) {
+  const s = typeof img === 'string' ? img.trim() : '';
+  if (!s) return '';
+  if (/^data:image\/(png|jpe?g|webp|gif);base64,/i.test(s)) {
+    return s.length <= 4 * 1024 * 1024 ? s : '';
+  }
+  if (/^https?:\/\/\S+$/i.test(s) && s.length <= 8192) return s;
+  return '';
+}
+
 // 用「当前屏幕上实际显示的选项顺序」构造请求，保证 AI 说的 A/B/C/D 和用户看到的一致
 function buildAiPayload(it) {
   const q = it.q;
@@ -3640,18 +4049,37 @@ function buildAiPayload(it) {
   const order = Array.isArray(it.order) && it.order.length === contents.length
     ? it.order
     : contents.map((_, i) => i);
+  // 与 Worker 一致的总大小上限，超出的图片不再上传，省流量也避免请求被拒
+  let imageBudget = 16 * 1024 * 1024;
+  let droppedImages = 0; // 因过大/格式不支持而没发给 AI 的图片数，用来提示用户
+  const takeImage = (img) => {
+    const raw = typeof img === 'string' ? img.trim() : '';
+    const v = aiImageValue(raw);
+    if (!v) {
+      if (/^(data:image\/|https?:\/\/)/i.test(raw)) droppedImages++;
+      return '';
+    }
+    if (v.length > imageBudget) { droppedImages++; return ''; }
+    imageBudget -= v.length;
+    return v;
+  };
+  const questionImage = takeImage(q.question_image);
   const options = labels.map((label, pos) => {
     const c = contents[order[pos]] || {};
-    return { label, text: c.text || (c.image ? '（图片选项）' : '') };
+    return {
+      label,
+      text: c.text || (c.image ? '（见选项配图）' : ''),
+      image: takeImage(c.image),
+    };
   });
   const answer = Array.isArray(it.currentAnswer) ? it.currentAnswer : [];
-  let question = String(q.question_text || '');
-  if (q.question_image) question += '\n（本题有配图，图片内容未提供）';
   return {
-    question,
+    question: String(q.question_text || ''),
+    questionImage,
     type: ['single', 'multiple', 'judge'].includes(q.type) ? q.type : 'single',
     options,
     answer,
+    droppedImages,
   };
 }
 
@@ -3701,9 +4129,10 @@ function remapAiLabels(text, fromOptions, toOptions) {
   if (!changed) return text;
 
   const remapInline = (line) => {
-    const inlineRe = /(选项\s*)([A-D])|([A-D])(\s*项)|([（(]\s*)([A-D])(\s*[）)])|([A-D](?:\s*[、,，/]\s*[A-D])+)/g;
+    // 「选项A、C」「选项A和C」要逐个替换，不能只换第一个字母
+    const inlineRe = /(选项\s*)([A-D](?:\s*[、,，/和]\s*[A-D])*)|([A-D])(\s*项)|([（(]\s*)([A-D])(\s*[）)])|([A-D](?:\s*[、,，/和]\s*[A-D])+)/g;
     return line.replace(inlineRe, (m, p1, l1, l2, p2, p3, l3, p4, run) => {
-      if (l1) return p1 + (map[l1] || l1);
+      if (l1) return p1 + l1.replace(/[A-D]/g, (ch) => map[ch] || ch);
       if (l2) return (map[l2] || l2) + p2;
       if (l3) return p3 + (map[l3] || l3) + p4;
       if (run) return run.replace(/[A-D]/g, (ch) => map[ch] || ch);
@@ -3712,12 +4141,20 @@ function remapAiLabels(text, fromOptions, toOptions) {
   };
 
   return String(text).split('\n').map((line) => {
-    const ans = line.match(/^(\s*答案\s*[：:]\s*)([\sA-D、,，;；/]+)$/);
+    // 答案行：兼容「答案：A」「答案：A。」「答案：A（…）」「**答案：A**」，
+    // 只换算「答案：」后开头那段字母，不动后面的解释。
+    const ans = line.match(/^(\s*(?:\*\*)?\s*答案\s*[：:]\s*)([\s\S]*)$/);
     if (ans) {
-      return ans[1] + ans[2].replace(/[A-D]/g, (ch) => map[ch] || ch);
+      const rest = ans[2];
+      const lead = rest.match(/^([A-D]{1,4}(?:\s*[、,，;；/和]\s*[A-D]{1,4})*)/);
+      if (lead) {
+        const tail = rest.slice(lead[1].length);
+        return ans[1] + lead[1].replace(/[A-D]/g, (ch) => map[ch] || ch) + remapInline(tail);
+      }
+      return remapInline(line);
     }
-    // 选项行：行首字母是编号，单独换算；其余部分再处理行内引用
-    const head = line.match(/^(\s*)([A-D])(?=\s*[.．:：]|\s+(?:对|错|正确|错误))([\s\S]*)$/);
+    // 选项行：行首字母是编号（兼容 **A.**），单独换算；其余部分再处理行内引用
+    const head = line.match(/^(\s*(?:\*\*|\*)?\s*)([A-D])(?=\s*[.．:：、]|\s+(?:对|错|正确|错误))([\s\S]*)$/);
     if (head) {
       return head[1] + (map[head[2]] || head[2]) + remapInline(head[3]);
     }
@@ -3726,18 +4163,24 @@ function remapAiLabels(text, fromOptions, toOptions) {
 }
 
 // 缓存 key 与选项顺序无关：顺序变了直接复用解析，再把字母换算过来
+// 图片也纳入 key：题干/选项图换了，解析必须重新生成
 function aiCacheKey(payload, q) {
-  const optionTexts = payload.options.map((o) => o.text).sort();
+  const optionKeys = payload.options
+    .map((o) => (o.image ? (o.text || '') + '|i:' + hashText(o.image) : (o.text || '')))
+    .sort();
   const answerTexts = payload.options
     .filter((o) => payload.answer.includes(o.label))
     .map((o) => o.text)
     .sort();
-  return String(q.id) + ':' + hashText(JSON.stringify({
+  // 纯文字题的 key 与旧版完全一致，避免升级后整库缓存失效；有图片才加入图片指纹
+  const keyData = {
     question: payload.question,
     type: payload.type,
-    options: optionTexts,
+    options: optionKeys,
     answer: answerTexts,
-  }));
+  };
+  if (payload.questionImage) keyData.questionImage = hashText(payload.questionImage);
+  return String(q.id) + ':' + hashText(JSON.stringify(keyData));
 }
 
 function readAiCache() {
@@ -3786,6 +4229,9 @@ async function askAi(force) {
   const q = it.q;
   const payload = buildAiPayload(it);
   const cacheKey = aiCacheKey(payload, q);
+  if (payload.droppedImages > 0) {
+    toast(`有 ${payload.droppedImages} 张图片过大或格式不支持，这次没有发给 AI`, false);
+  }
   openAiModal();
   const noteBtn = $('#ai-to-note');
   noteBtn.classList.add('hidden');
@@ -3801,41 +4247,141 @@ async function askAi(force) {
   }
 
   aiBusy = true;
-  $('#ai-content').innerHTML = '<span class="text-slate-400"><i class="fa fa-spinner fa-spin mr-1"></i>AI 正在思考…</span>';
+  let waited = 0;
+  let waitingLabel = 'AI 正在思考…';
+  const spinner = () => {
+    $('#ai-content').innerHTML =
+      '<span class="text-slate-400"><i class="fa fa-spinner fa-spin mr-1"></i>' +
+      escapeHtml(waitingLabel) + '已 ' + waited + ' 秒</span>';
+  };
+  spinner();
+  const spinnerTimer = setInterval(() => {
+    if (latest) return;
+    waited++;
+    spinner();
+  }, 1000);
   $('#ai-retry').classList.add('hidden');
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 60000);
-  try {
-    const res = await fetch(AI_ENDPOINT, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: 'Bearer ' + token,
-      },
-      body: JSON.stringify(payload),
-      signal: controller.signal,
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      if (res.status === 401) throw new Error('口令无效，请在网址后加 #ai-unlock 重新输入');
-      throw new Error(data.error || 'AI 请求失败');
+  let latest = '';
+  const showText = (text) => {
+    latest = text;
+    setAiContent(text);
+    const box = $('#ai-content');
+    box.scrollTop = box.scrollHeight;
+  };
+  // 读取流式响应：DeepSeek 每吐出几个字就刷新一次弹窗
+  const readStream = async (res, onTick) => {
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let full = '';
+    const handleLine = (line) => {
+      if (!line.startsWith('data:')) return;
+      const raw = line.slice(5).trim();
+      if (!raw || raw === '[DONE]') return;
+      let obj;
+      try { obj = JSON.parse(raw); } catch (e) { return; }
+      const delta = (obj.choices && obj.choices[0] && obj.choices[0].delta) || {};
+      const piece = typeof delta.content === 'string' ? delta.content : '';
+      if (piece) {
+        full += piece;
+        showText(full);
+      }
+    };
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      onTick();
+      buffer += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buffer.indexOf('\n')) >= 0) {
+        handleLine(buffer.slice(0, idx).replace(/\r$/, ''));
+        buffer = buffer.slice(idx + 1);
+      }
     }
-    if (!data.content) throw new Error('AI 没有返回内容，请重试');
-    setAiContent(data.content);
-    writeAiCache(cacheKey, data.content, aiOptionKeys(it));
+    buffer += decoder.decode();
+    buffer.split('\n').forEach((line) => handleLine(line.replace(/\r$/, '')));
+    return full;
+  };
+
+  // 单次请求；空闲 90 秒没有新数据才超时（带图上传/模型思考可能较久），整体最多 140 秒
+  const runOnce = async () => {
+    const controller = new AbortController();
+    let idleTimer = null;
+    const resetIdle = () => {
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => controller.abort(), 90000);
+    };
+    const totalTimer = setTimeout(() => controller.abort(), 140000);
+    resetIdle();
+    try {
+      const res = await fetch(AI_ENDPOINT, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer ' + token,
+        },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        if (res.status === 401) throw new Error('口令无效，请在网址后加 #ai-unlock 重新输入');
+        throw new Error(data.error || 'AI 请求失败');
+      }
+      const ctype = res.headers.get('content-type') || '';
+      if (ctype.includes('text/event-stream') && res.body) {
+        const text = await readStream(res, resetIdle);
+        if (!text.trim()) throw new Error('AI 没有返回内容，请重试');
+        return text;
+      }
+      // 服务端未按流式返回时的兼容分支
+      const data = await res.json().catch(() => ({}));
+      if (!data.content) throw new Error('AI 没有返回内容，请重试');
+      showText(data.content);
+      return data.content;
+    } finally {
+      clearTimeout(idleTimer);
+      clearTimeout(totalTimer);
+    }
+  };
+
+  try {
+    let content;
+    try {
+      content = await runOnce();
+    } catch (e) {
+      // 网络层断开（Failed to fetch）且还没显示任何内容时，自动重试一次
+      if (e && e.name === 'TypeError' && !latest) {
+        waitingLabel = '网络不稳定，正在自动重试…';
+        waited = 0;
+        spinner();
+        content = await runOnce();
+      } else {
+        throw e;
+      }
+    }
+    writeAiCache(cacheKey, content, aiOptionKeys(it));
     $('#ai-retry').classList.remove('hidden');
     noteBtn.classList.remove('hidden');
   } catch (e) {
-    setAiContent(e.name === 'AbortError' ? 'AI 响应超时，请重试。' : ('出错了：' + e.message));
+    const msg = e && e.name === 'AbortError'
+      ? 'AI 响应超时，可点「重新生成」再试'
+      : e && e.name === 'TypeError'
+        ? '网络连接中断（Failed to fetch），请检查网络后点「重新生成」'
+        : '出错了：' + ((e && e.message) || '未知错误');
+    setAiContent(latest ? latest + '\n\n（' + msg + '）' : msg);
     $('#ai-retry').classList.remove('hidden');
   } finally {
-    clearTimeout(timer);
+    clearInterval(spinnerTimer);
     aiBusy = false;
   }
 }
 
-$('#review-ai-btn').addEventListener('click', () => askAi(false));
+$('#review-ai-btn').addEventListener('click', () => {
+  clearReviewAutoTimer();
+  askAi(false);
+});
 $('#ai-retry').addEventListener('click', () => askAi(true));
 // 一键把当前显示的解析存成这道题的笔记（之后可在笔记里自行编辑）
 $('#ai-to-note').addEventListener('click', async () => {
@@ -3863,6 +4409,7 @@ $('#ai-modal').addEventListener('click', (e) => {
 // ============ 初始化 ============
 async function init() {
   initAiUnlock();
+  updateAutoNextUI();
   setType('single');
   switchTab('review');
   refreshBadge();

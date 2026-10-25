@@ -28,6 +28,21 @@ function messageText(message) {
   return '';
 }
 
+const MAX_IMAGE_CHARS = 4 * 1024 * 1024;
+const MAX_TOTAL_IMAGE_CHARS = 16 * 1024 * 1024;
+
+// 只接受压缩后的本地位图 data URL 或公网 http(s) 图片，其它一律丢弃
+function normalizeImage(value) {
+  if (typeof value !== 'string') return '';
+  const s = value.trim();
+  if (!s) return '';
+  if (/^data:image\/(png|jpe?g|webp|gif);base64,[A-Za-z0-9+/=\s]+$/i.test(s)) {
+    return s.length <= MAX_IMAGE_CHARS ? s : '';
+  }
+  if (/^https?:\/\/\S+$/i.test(s) && s.length <= 8192) return s;
+  return '';
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -74,25 +89,68 @@ async function handleAI(request, env) {
   } catch {
     return json({ error: 'JSON 格式错误' }, 400);
   }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return json({ error: 'JSON 格式错误' }, 400);
+  }
 
   const question = String(body.question || '').trim();
-  if (!question) return json({ error: '题目为空' }, 400);
+  const questionImageRaw = normalizeImage(body.questionImage);
+  if (!question && !questionImageRaw) return json({ error: '题目为空' }, 400);
   if (question.length > 3000) return json({ error: '题目过长' }, 413);
 
   const type = ['single', 'multiple', 'judge'].includes(body.type) ? body.type : 'single';
   const typeName = { single: '单选题', multiple: '多选题', judge: '判断题' }[type];
   const options = (Array.isArray(body.options) ? body.options : [])
     .slice(0, 4)
-    .map((o) => ({
-      label: String(o.label || '').slice(0, 1),
-      text: String(o.text || '').trim().slice(0, 500),
-    }));
+    .map((raw) => {
+      const o = (raw && typeof raw === 'object') ? raw : {};
+      return {
+        label: String(o.label || '').slice(0, 1),
+        text: String(o.text || '').trim().slice(0, 500),
+        image: normalizeImage(o.image),
+      };
+    });
+
+  // 图片总大小限制在 16MB 内（控制 Worker 内存与上传耗时，远低于 DeepSeek 48MB 上限）
+  let imageBudget = MAX_TOTAL_IMAGE_CHARS;
+  const takeImage = (img) => {
+    if (!img || img.length > imageBudget) return '';
+    imageBudget -= img.length;
+    return img;
+  };
+  const questionImage = takeImage(questionImageRaw);
+  options.forEach((o) => { o.image = takeImage(o.image); });
+
   const answer = (Array.isArray(body.answer) ? body.answer : []).map(String).slice(0, 4);
   const answerText = options
     .filter((o) => answer.includes(o.label))
     .map((o) => o.text)
     .join('；');
   const optionText = options.map((o) => o.label + '. ' + o.text).join('\n');
+  const hasImages = !!questionImage || options.some((o) => o.image);
+
+  const userText =
+    '题型：' + typeName +
+    '\n题干：' + question +
+    '\n选项：\n' + optionText +
+    '\n给定正确答案：' + answer.join('、') +
+    (answerText ? '（对应内容：' + answerText + '）' : '') +
+    '\n\n请按上面的选项顺序解析这道题。' +
+    (hasImages ? '\n（题干和选项的配图已附在下方，请结合图片内容作答；看不清就说看不清，不要编造图片内容。）' : '');
+
+  let userContent = userText;
+  if (hasImages) {
+    userContent = [{ type: 'text', text: userText }];
+    if (questionImage) {
+      userContent.push({ type: 'text', text: '题干配图：' });
+      userContent.push({ type: 'image_url', image_url: { url: questionImage, detail: 'high' } });
+    }
+    options.forEach((o) => {
+      if (!o.image) return;
+      userContent.push({ type: 'text', text: '选项' + o.label + '配图：' });
+      userContent.push({ type: 'image_url', image_url: { url: o.image, detail: 'high' } });
+    });
+  }
 
   const messages = [
     {
@@ -104,68 +162,81 @@ async function handleAI(request, env) {
         '3) 有公式或计算必须写公式，公式一律用普通字符直接打成一行，方便复制，不要用 LaTeX 或反斜杠写法（禁止出现 \\( \\)、\\[ \\]、\\propto、\\frac、\\times 等标记）。示例：Tm ∝ U1²、Tm ∝ 1/(X1+X2′)、sm ∝ R2；每个公式后面用一句话说明符号含义（如「Tm 是最大转矩，U1 是定子电压」）；' +
         '4) 计算题按「公式 → 代入数字 → 得出结果」一步步写清楚；' +
         '5) 答案以题目给定的正确答案为准，不要编造；' +
-        '6) 全文控制在 200 字以内。',
+        '6) 题目或选项附有图片时，必须结合图片内容解析；图片看不清就直说，不要编造图片里的内容；' +
+        '7) 全文控制在 200 字以内。',
     },
     {
       role: 'user',
-      content:
-        '题型：' + typeName +
-        '\n题干：' + question +
-        '\n选项：\n' + optionText +
-        '\n给定正确答案：' + answer.join('、') +
-        (answerText ? '（对应内容：' + answerText + '）' : '') +
-        '\n\n请按上面的选项顺序解析这道题。',
+      content: userContent,
     },
   ];
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 45000);
-  try {
-    let content = '';
-    let finishReason = '';
-    // 推理型模型可能把额度先花在思考上，导致正文为空：自动重试一次
-    for (let attempt = 0; attempt < 2 && !content; attempt++) {
-      const resp = await fetch(DEEPSEEK_URL, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: 'Bearer ' + env.DEEPSEEK_API_KEY,
-        },
-        body: JSON.stringify({
-          model: env.DEEPSEEK_MODEL || 'deepseek-flash',
-          messages,
-          temperature: 0.3,
-          max_tokens: 3000,
-          stream: false,
-        }),
-        signal: controller.signal,
-      });
+  // 比客户端总超时（140 秒）略长，保证超时由前端先提示，服务端不会先掐断流
+  const timer = setTimeout(() => controller.abort(), 150000);
 
-      const data = await resp.json().catch(() => ({}));
-      if (!resp.ok) {
-        console.error('DeepSeek error', resp.status, data);
-        return json({ error: 'AI 服务错误（' + resp.status + '）' }, 502);
-      }
-      const choice = (data.choices && data.choices[0]) || {};
-      finishReason = choice.finish_reason || '';
-      content = messageText(choice.message).trim();
-      if (!content) {
-        console.error('DeepSeek empty content', finishReason, JSON.stringify(data).slice(0, 500));
-      }
-    }
+  let upstream;
+  try {
+    upstream = await fetch(DEEPSEEK_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer ' + env.DEEPSEEK_API_KEY,
+      },
+      body: JSON.stringify({
+        model: env.DEEPSEEK_MODEL || 'deepseek-flash',
+        messages,
+        temperature: 0.3,
+        max_tokens: 3000,
+        stream: true,
+      }),
+      signal: controller.signal,
+    });
+  } catch (e) {
+    clearTimeout(timer);
+    return json(
+      { error: e.name === 'AbortError' ? 'AI 响应超时' : '无法连接 AI 服务' },
+      504
+    );
+  }
+
+  if (!upstream.ok) {
+    clearTimeout(timer);
+    const data = await upstream.json().catch(() => ({}));
+    console.error('DeepSeek error', upstream.status, data);
+    return json({ error: 'AI 服务错误（' + upstream.status + '）' }, 502);
+  }
+
+  const contentType = upstream.headers.get('content-type') || '';
+  // 万一上游没按流式返回，退化成一次性 JSON
+  if (!contentType.includes('text/event-stream') || !upstream.body) {
+    clearTimeout(timer);
+    const data = await upstream.json().catch(() => ({}));
+    const choice = (data.choices && data.choices[0]) || {};
+    const content = messageText(choice.message).trim();
     if (!content) {
       return json(
-        { error: finishReason === 'length' ? 'AI 回答被截断，请重试' : 'AI 没有返回内容，请重试' },
+        { error: choice.finish_reason === 'length' ? 'AI 回答被截断，请重试' : 'AI 没有返回内容，请重试' },
         502
       );
     }
     return json({ content }, 200);
-  } catch (e) {
-    return json(
-      { error: e.name === 'AbortError' ? 'AI 响应超时' : 'AI 请求失败' },
-      504
-    );
-  } finally {
-    clearTimeout(timer);
   }
+
+  // 边生成边转发：浏览器先看到字，长请求也不容易被网络中断
+  const stream = upstream.body.pipeThrough(
+    new TransformStream({
+      flush() { clearTimeout(timer); },
+      cancel() { clearTimeout(timer); controller.abort(); },
+    })
+  );
+
+  return new Response(stream, {
+    status: 200,
+    headers: {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-store',
+      'X-Accel-Buffering': 'no',
+    },
+  });
 }

@@ -26,7 +26,7 @@
     }
   </script>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/font-awesome@4.7.0/css/font-awesome.min.css" />
-  <link rel="stylesheet" href="css/style.css?v=27" />
+  <link rel="stylesheet" href="css/style.css?v=33" />
 </head>
 <body class="bg-slate-100 min-h-screen text-slate-800">
 
@@ -40,12 +40,17 @@
         </h1>
         <nav class="flex items-center gap-1 shrink-0 w-full sm:w-auto sm:justify-end">
           <div class="relative shrink-0 sm:mr-1">
-            <button id="backup-btn" class="px-2 py-2 rounded-lg text-slate-500 hover:bg-slate-100 transition" title="备份 / 恢复">
+            <button id="backup-btn" class="px-2 py-2 rounded-lg text-slate-500 hover:bg-slate-100 transition" title="设置 / 备份" aria-label="设置和备份" aria-haspopup="true" aria-expanded="false">
               <i class="fa fa-cog text-lg"></i>
             </button>
-            <div id="backup-menu" class="hidden absolute left-0 top-full mt-1 w-36 bg-white rounded-lg shadow-lg border border-slate-200 py-1 z-50">
+            <div id="backup-menu" class="hidden absolute left-0 top-full mt-1 w-56 bg-white rounded-lg shadow-lg border border-slate-200 py-1 z-50">
               <button id="export-btn" class="w-full text-left px-4 py-2 text-sm text-slate-700 hover:bg-slate-50 transition whitespace-nowrap"><i class="fa fa-download mr-2 text-slate-400"></i>导出备份</button>
               <button id="import-btn" class="w-full text-left px-4 py-2 text-sm text-slate-700 hover:bg-slate-50 transition whitespace-nowrap"><i class="fa fa-upload mr-2 text-slate-400"></i>导入备份</button>
+              <div class="border-t border-slate-100 my-1"></div>
+              <button id="auto-next-toggle" type="button" class="w-full flex items-center justify-between gap-2 px-4 py-2 text-sm text-slate-700 hover:bg-slate-50 transition whitespace-nowrap" aria-pressed="true" title="开启后，复习和题库答对都会自动跳到下一题">
+                <span><i class="fa fa-forward mr-2 text-slate-400"></i>答对自动下一题</span>
+                <span id="auto-next-state" class="shrink-0 text-xs px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700 font-medium">开</span>
+              </button>
             </div>
             <input type="file" id="import-file" accept=".json" multiple class="hidden" />
           </div>
@@ -250,12 +255,16 @@
           <div class="flex items-center justify-between text-xs text-slate-400 mb-3">
             <span id="review-progress"></span>
             <div class="flex items-center gap-2">
-              <span id="review-type-badge" class="px-2 py-0.5 rounded-full bg-slate-100 font-medium"></span>
               <button id="review-subject-btn" class="text-slate-400 hover:text-primary-500 transition hidden" title="设置科目"><i class="fa fa-tag"></i></button>
             </div>
           </div>
-          <div id="review-cnt" class="mb-3 flex flex-wrap gap-2 text-xs"></div>
-          <div id="review-question" class="text-base font-medium whitespace-pre-wrap"></div>
+          <div class="mb-3 flex flex-wrap items-center gap-2">
+            <span id="review-type-badge" class="type-pill"></span>
+            <div id="review-cnt" class="flex flex-wrap gap-2 text-xs"></div>
+          </div>
+          <div class="mb-3">
+            <div id="review-question" class="text-base font-medium whitespace-pre-wrap"></div>
+          </div>
           <img id="review-image" class="hidden mt-3 max-h-72 rounded-lg" alt="" />
           <div id="review-options" class="mt-4 space-y-2"></div>
           <div id="review-result" class="hidden mt-4"></div>
@@ -323,11 +332,16 @@
       <!-- 刷题 -->
       <div id="bank-quiz" class="hidden">
         <div class="bg-white rounded-xl shadow-sm p-6 pb-28">
-          <div class="flex items-center justify-between text-xs text-slate-400 mb-3">
+          <div class="flex items-center justify-between gap-2 text-xs text-slate-400 mb-3">
             <span id="bank-progress"></span>
-            <span id="bank-type-badge"></span>
+            <div class="flex items-center gap-2">
+              <span id="bank-type-badge" class="type-pill"></span>
+              <span id="bank-category-badge"></span>
+            </div>
           </div>
-          <div id="bank-question" class="text-base font-medium whitespace-pre-wrap"></div>
+          <div class="mb-3">
+            <div id="bank-question" class="text-base font-medium whitespace-pre-wrap"></div>
+          </div>
           <div id="bank-options" class="mt-4 space-y-2"></div>
           <div id="bank-result" class="hidden mt-4"></div>
 
@@ -365,7 +379,7 @@
         <div id="list-filter-bar" class="mb-3">
           <div class="relative">
             <i class="fa fa-search absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 text-sm"></i>
-            <input id="list-search" type="text" class="w-full rounded-lg border border-slate-300 pl-9 pr-8 py-2 text-sm focus:ring-2 focus:ring-primary-300 focus:outline-none" placeholder="搜索题干 / 选项 / 备注" />
+            <input id="list-search" type="text" class="w-full rounded-lg border border-slate-300 pl-9 pr-8 py-2 text-sm focus:ring-2 focus:ring-primary-300 focus:outline-none" placeholder="搜索全部错题（题干 / 选项 / 备注）" />
             <button id="list-search-clear" class="hidden absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600"><i class="fa fa-times-circle"></i></button>
           </div>
         </div>
@@ -513,6 +527,6 @@
   <div id="toast" class="fixed bottom-6 left-1/2 -translate-x-1/2 bg-slate-800 text-white px-5 py-2.5 rounded-lg shadow-lg text-sm opacity-0 transition pointer-events-none z-50"></div>
 
   <script src="js/bank_data.js"></script>
-  <script src="js/app.js?v=135"></script>
+  <script src="js/app.js?v=146"></script>
 </body>
 </html>
