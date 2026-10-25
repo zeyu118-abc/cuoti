@@ -594,6 +594,16 @@ function normalizeLabel(raw) {
   return NUM_TO_LABEL[up] || up;
 }
 
+// 备份导入与 JSON 录入共用：把答案统一成标签数组，支持数组、单个字母、合并串 "AC"/"A,C"/"A、C"
+function parseAnswerTokens(rawAnswer) {
+  if (Array.isArray(rawAnswer)) return rawAnswer.map((x) => String(x).trim());
+  if (rawAnswer == null) return [];
+  const s = String(rawAnswer).trim().toUpperCase();
+  if (/^[A-D]{2,4}$/.test(s)) return s.split('');
+  if (/^[A-D](?:[,，、\s]+[A-D])+$/.test(s)) return s.split(/[^A-D]+/).filter(Boolean);
+  return [s];
+}
+
 function parseOptionLine(line) {
   let m;
   // 1) 数字序号 + 选项字母（如 "4B."、"1 A."）
@@ -1269,8 +1279,9 @@ $('#save-btn').addEventListener('click', async () => {
           }
         }
 
-        // 原来有待重做、改完仍是错题：补一条新的重做项，避免“改个题干就不用重做”
-        if (hadPendingRedo) {
+        // 原来有待重做、或这次改答案把「对」改成「错」：补一条新的重做项，
+        // 避免“改个题干/改个答案就不用重做”
+        if (hadPendingRedo || regraded === 'wrong') {
           const mainItem = reviewQueue.find((x) => x.q.id === editingId && x.kind === 'main');
           const stillHasPending = reviewQueue.some(
             (x) => x.q.id === editingId && x.kind === 'redo' && x.status === 'pending'
@@ -1598,6 +1609,19 @@ function pendingRedoCount() {
   return reviewQueue.filter((x) => x.kind === 'redo' && x.status === 'pending').length;
 }
 
+// 顶部进度单独刷新：提交后 pending 数会立刻变，不能等下一次 renderQuestion
+function updateReviewProgress() {
+  const it = currentItem();
+  const el = $('#review-progress');
+  if (!it || !el) return;
+  if (it.kind === 'main') {
+    const pos = (it.seq != null ? it.seq : reviewIndex) + 1;
+    el.textContent = `第 ${pos} / ${reviewTotal} 题`;
+  } else {
+    el.textContent = `错题重做 · 剩 ${pendingRedoCount()} 题`;
+  }
+}
+
 // 「下一题」是否显示：还有下一题、或还有未做题可跳转时显示；回看模式浏览到最后一道时隐藏
 function shouldShowNext() {
   if (isBrowsing) return reviewIndex + 1 < reviewQueue.length;
@@ -1660,12 +1684,7 @@ function renderQuestion() {
 
   const selectedAnswer = it.selectedAnswer || [];
 
-  if (it.kind === 'main') {
-    const pos = (it.seq != null ? it.seq : reviewIndex) + 1;
-    $('#review-progress').textContent = `第 ${pos} / ${reviewTotal} 题`;
-  } else {
-    $('#review-progress').textContent = `错题重做 · 剩 ${pendingRedoCount()} 题`;
-  }
+  updateReviewProgress();
   $('#review-count').textContent = pendingMainCount();
   $('#review-cnt').innerHTML =
     `<span class="px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-600 font-medium">答对 ${Number(q.correct_count) || 0} 次</span>` +
@@ -1992,6 +2011,7 @@ function renderAnsweredState(it) {
   const selectedAnswer = it.selectedAnswer || [];
   const currentAnswer = it.currentAnswer || [];
 
+  updateReviewProgress();
   $('#review-count').textContent = pendingMainCount();
   // 答对/答错次数随本次提交立即刷新（首次做对后 correct_count 已 +1，需同步显示）
   $('#review-cnt').innerHTML =
@@ -2081,13 +2101,46 @@ async function submitCurrentAnswer() {
     it.prevState = prevState;
     // 这一轮重新开始，之前的“上次选择”已失效；重做时 enterRedo 会重新记
     it.prevSelected = null;
+  } else if (isManualRetry) {
+    // 答题卡「手动重做」也算一次真实作答：更新对错次数与上次结果，
+    // 但不改复习轮次/下次日期（本次复习今天已经结算过，重做只是补练）
+    const q = it.q;
+    const changes = {
+      last_reviewed: fmtDate(new Date()),
+      last_result: correct ? 'correct' : 'wrong',
+      correct_count: (Number(q.correct_count) || 0) + (correct ? 1 : 0),
+      wrong_count: (Number(q.wrong_count) || 0) + (correct ? 0 : 1),
+    };
+    try {
+      await dbPut({ ...q, ...changes });
+    } catch (e) {
+      setReviewOptionsLocked(false);
+      toast('保存失败：' + e.message, false);
+      return;
+    }
+    Object.assign(q, changes);
   }
 
   it.status = correct ? 'correct' : 'wrong';
   it.retry = false;
 
-  // 做错：除「答题卡手动重做」外，都追加到队尾再练一次，直到做对
-  if (!correct && !isManualRetry) {
+  // 手动重做答对：这道题对应的待重做项已经完成，删掉，避免答题卡还留一条“待做”
+  if (correct && it.kind === 'main') {
+    for (let i = reviewQueue.length - 1; i >= 0; i--) {
+      const x = reviewQueue[i];
+      if (x.kind === 'redo' && x.q.id === it.q.id && x.status === 'pending') {
+        reviewQueue.splice(i, 1);
+        if (i < reviewIndex) reviewIndex--;
+      }
+    }
+    if (reviewIndex >= reviewQueue.length) reviewIndex = Math.max(0, reviewQueue.length - 1);
+  }
+
+  // 做错：队尾追加一次重做；手动重做答错时，若已有待重做项就不重复加
+  const hasPendingRedoForQ = reviewQueue.some(
+    (x) => x.kind === 'redo' && x.q.id === it.q.id && x.status === 'pending'
+  );
+  if (!correct && !hasPendingRedoForQ) {
     reviewQueue.push({ q: it.q, status: 'pending', kind: 'redo', retry: false, selectedAnswer: [], prevSelected: null });
   }
 
@@ -2147,7 +2200,6 @@ function advanceReview() {
 function scheduleReviewAutoNext() {
   clearReviewAutoTimer();
   if (!autoNextEnabled()) return;
-  if (!reviewQueue.some((x) => x.status === 'pending')) return;
   const it = currentItem();
   if (!it || it.status !== 'correct') return;
   reviewAutoTimer = setTimeout(() => {
@@ -2158,6 +2210,11 @@ function scheduleReviewAutoNext() {
     if ($('#review-box').classList.contains('hidden')) return;
     if (!$('#answer-sheet-modal').classList.contains('hidden')) return;
     if (!$('#ai-modal').classList.contains('hidden')) return;
+    // 最后一道答对：自动进入完成页，和题库最后一题的行为区分开（题库停在结果页）
+    if (!reviewQueue.some((x) => x.status === 'pending')) {
+      showReviewComplete();
+      return;
+    }
     advanceReview();
   }, REVIEW_AUTO_NEXT_DELAY);
 }
@@ -2470,11 +2527,14 @@ async function loadList() {
 
   currentFullList = fullList;
   currentPageList = pageList;
-  // 「共 X 题」：纯主列表（无搜索、无题型筛选）显示所有手动题总数（含已分科目的），避免设科目后总数减少
+  // 数量口径：当前列表显示多少题就写多少题；纯主列表再额外显示「全部手动题」总数，
+  // 避免「共 10 题」但只看到 2 张卡片、或设科目后总数突然变少。
   const isPlainAll = listView.mode === 'all' && !listKeyword && listView.typeFilter === 'all';
-  $('#list-total').textContent = isPlainAll
-    ? all.filter((q) => q.bank_id == null).length
-    : fullList.length;
+  const allManualCount = all.filter((q) => q.bank_id == null).length;
+  $('#list-total-label').textContent = isPlainAll ? '未分类' : '共';
+  $('#list-total').textContent = fullList.length;
+  $('#list-total-all-wrap').classList.toggle('hidden', !isPlainAll);
+  $('#list-total-all').textContent = allManualCount;
   renderListCards(pageList);
   let emptyText = '';
   if (listKeyword) emptyText = '没有找到匹配的题目';
@@ -3374,17 +3434,7 @@ function normalizeQuestion(raw, idx) {
   }
 
   // 答案：支持数组、单个字母、合并字符串（"AC" / "A,C" / "A、C"）；判断支持「对/错」文字自动转 A/B
-  let answer;
-  if (Array.isArray(raw.answer)) {
-    answer = raw.answer.map((x) => String(x).trim().toUpperCase());
-  } else if (raw.answer != null) {
-    const s = String(raw.answer).trim().toUpperCase();
-    if (/^[A-D]{2,4}$/.test(s)) answer = s.split('');
-    else if (/^[A-D](?:[,，、\s]+[A-D])+$/.test(s)) answer = s.split(/[^A-D]+/).filter(Boolean);
-    else answer = [s];
-  } else {
-    answer = [];
-  }
+  let answer = parseAnswerTokens(raw.answer);
   if (type === 'judge') {
     answer = answer.map((a) => {
       if (/^(正确|对|√|✓|TRUE|是|A)$/.test(a)) return 'A';
@@ -3444,9 +3494,9 @@ function sanitizeBackupQuestion(raw) {
   }
   const labels = type === 'judge' ? LABELS_JUDGE : LABELS_ALL;
 
-  // 答案：对/错文字转 A/B，全角字母与数字序号归一，过滤非法标签
-  let answerRaw = Array.isArray(raw.answer) ? raw.answer : (raw.answer != null ? [raw.answer] : []);
-  answerRaw = answerRaw.map((a) => String(a).trim());
+  // 答案：对/错文字转 A/B，全角字母与数字序号归一，过滤非法标签；
+  // 与 JSON 录入共用 parseAnswerTokens，支持 "AC" / "A,C" 合并串，不再整条丢弃
+  let answerRaw = parseAnswerTokens(raw.answer);
   if (type === 'judge') {
     answerRaw = answerRaw.map((a) =>
       /^(正确|对|√|✓|TRUE|是|A)$/i.test(a) ? 'A' :
@@ -3859,6 +3909,8 @@ function clearBankAutoTimer() {
 function scheduleAutoNext() {
   clearBankAutoTimer();
   if (!autoNextEnabled()) return;
+  // 最后一题不要自动退出：让用户看清判分和正确答案；手动点「下一题」再回分类
+  if (bankIndex >= bankList.length - 1) return;
   bankAutoTimer = setTimeout(() => {
     bankAutoTimer = null;
     if (!autoNextEnabled()) return;
@@ -3901,7 +3953,7 @@ function bankNext() {
       renderBankQuestion();
     } else {
       saveBankProgress(bankCategory, bankList.length);
-      clearBankAnswers(bankCategory);
+      // 保留作答记录：下次进来只从第一题重新开始，不再把整类答题卡清空
       toast('本分类已刷完');
       if (backHandlers.length > 0) history.back();
       else renderBankCategories();
