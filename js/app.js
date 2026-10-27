@@ -132,10 +132,28 @@ async function dbPut(q) {
   const db = await openDB();
   return new Promise((resolve, reject) => {
     const tx = db.transaction('questions', 'readwrite');
-    const req = tx.objectStore('questions').put(q);
-    tx.oncomplete = () => resolve(req.result);
-    tx.onerror = () => reject(tx.error);
-    tx.onabort = () => reject(tx.error);
+    const store = tx.objectStore('questions');
+    let missing = false;
+    // put 是 upsert：如果别的标签页已经删了这道题，旧页面再提交会把题“复活”。
+    // 先确认记录还在，再更新；不存在就报错，让调用方提示，而不是重建。
+    const getReq = store.get(q.id);
+    getReq.onsuccess = () => {
+      if (getReq.result === undefined) {
+        missing = true;
+        tx.abort();
+        return;
+      }
+      store.put(q);
+    };
+    tx.oncomplete = () => resolve(q.id);
+    tx.onerror = () => {
+      if (missing) reject(new Error('题目已不存在（可能已在其它标签页删除）'));
+      else reject(tx.error);
+    };
+    tx.onabort = () => {
+      if (missing) reject(new Error('题目已不存在（可能已在其它标签页删除）'));
+      else reject(tx.error);
+    };
   });
 }
 async function dbGetAll() {
@@ -386,7 +404,20 @@ function pushListPageBack() {
 
 window.addEventListener('popstate', () => {
   const backFn = backHandlers.pop();
-  if (backFn) backFn();
+  if (!backFn) return;
+  // 手机返回键/浏览器后退也要走“未保存确认”，不能只保护页签点击
+  if (isInputDirty() && !confirm('当前录入的内容还没保存，确定离开吗？')) {
+    backHandlers.push(backFn);
+    history.pushState({ back: backHandlers.length }, '');
+    return;
+  }
+  backFn();
+});
+// 刷新/关闭页面时也提示（浏览器只显示通用文案，不能自定义）
+window.addEventListener('beforeunload', (e) => {
+  if (!isInputDirty()) return;
+  e.preventDefault();
+  e.returnValue = '';
 });
 
 // ============ 题型与选项 ============
@@ -1566,16 +1597,8 @@ async function loadReview() {
     } else {
       isBrowsing = false; // 正常复习（还有待做题）
       if (reviewIndex >= reviewQueue.length) reviewIndex = 0;
-      // 刷新/重新进入复习时，若当前题已答，按「从答题卡进入」同样转成重做，方便继续作答
-      const cur = currentItem();
-      if (cur && cur.status !== 'pending' && cur.retry !== true) {
-        // 先把「上次实际选了什么」单独存一份，供改答案重判用；selectedAnswer 要清空才能重做
-        if (!Array.isArray(cur.prevSelected) || cur.prevSelected.length === 0) {
-          cur.prevSelected = Array.isArray(cur.selectedAnswer) ? cur.selectedAnswer.slice() : [];
-        }
-        cur.retry = true;
-        cur.selectedAnswer = [];
-      }
+      // 已答过的当前题保持“已判分”状态，不自动变成可重答。
+      // 需要重做时从答题卡进入（enterRedo），避免切页签就重复累计答对/答错次数。
       renderQuestion();
     }
   } else {
@@ -2399,12 +2422,19 @@ $('#review-note-cancel').addEventListener('click', () => {
   $('#review-edit-btn').classList.remove('hidden');
 });
 
+let reviewNoteSaving = false;
 $('#review-note-save').addEventListener('click', async () => {
-  const q = currentItem().q;
+  if (reviewNoteSaving) return;
+  const it = currentItem();
+  if (!it) return;
+  const q = it.q;
   const text = $('#review-note-text').value.trim();
   if (!text) return toast('请先输入笔记内容', false);
   if (!Array.isArray(q.notes)) q.notes = [];
-  q.notes.push({ text, created_at: new Date().toISOString() });
+  const note = { text, created_at: new Date().toISOString() };
+  q.notes.push(note);
+  reviewNoteSaving = true;
+  $('#review-note-save').disabled = true;
   try {
     await dbPut(q);
     toast('笔记已保存');
@@ -2414,7 +2444,12 @@ $('#review-note-save').addEventListener('click', async () => {
     $('#review-edit-btn').classList.remove('hidden');
     renderReviewNote(q);
   } catch (e) {
-    toast(e.message, false);
+    // 写库失败/题目已被别的标签页删除：撤回刚加的笔记，保留输入内容
+    q.notes = q.notes.filter((n) => n !== note);
+    toast('保存失败：' + e.message, false);
+  } finally {
+    reviewNoteSaving = false;
+    $('#review-note-save').disabled = false;
   }
 });
 
@@ -3028,17 +3063,28 @@ function renderDetail(q) {
   const detailSubjectBtn = $('#detail-subject');
   if (detailSubjectBtn) detailSubjectBtn.addEventListener('click', () => openSubjectModal(q, 'detail'));
 
+  let detailNoteSaving = false;
   $('#detail-note-save').addEventListener('click', async () => {
+    if (detailNoteSaving) return;
     const text = $('#detail-note-text').value.trim();
     if (!text) return toast('请先输入笔记内容', false);
     if (!Array.isArray(q.notes)) q.notes = [];
-    q.notes.push({ text, created_at: new Date().toISOString() });
+    const note = { text, created_at: new Date().toISOString() };
+    q.notes.push(note);
+    detailNoteSaving = true;
+    $('#detail-note-save').disabled = true;
     try {
       await dbPut(q);
       toast('笔记已保存');
       renderDetail(q);
     } catch (e) {
+      q.notes = q.notes.filter((n) => n !== note);
       toast('保存失败：' + e.message, false);
+    } finally {
+      detailNoteSaving = false;
+      // renderDetail 可能已重建按钮；旧按钮禁用状态不影响新节点
+      const btn = $('#detail-note-save');
+      if (btn) btn.disabled = false;
     }
   });
 
@@ -3962,6 +4008,9 @@ function bankSubmit() {
   const correct = sameSet(item.selected, q.answer || []);
   item.status = correct ? 'correct' : 'wrong';
   saveBankAnswer(bankCategory, q.bank_id, item.status, item.selected);
+  // 提交即保存进度：答完不点“下一题”就切页签/返回，分类卡也不会还是“未开始”；
+  // 最后一题提交后记成 length，分类卡显示“已刷完”。
+  saveBankProgress(bankCategory, bankIndex >= bankList.length - 1 ? bankList.length : bankIndex);
   if (!correct) {
     addToWrongBook(q);
     toast('已记入错题本');
@@ -4465,21 +4514,30 @@ $('#review-ai-btn').addEventListener('click', () => {
 });
 $('#ai-retry').addEventListener('click', () => askAi(true));
 // 一键把当前显示的解析存成这道题的笔记（之后可在笔记里自行编辑）
+let aiNoteSaving = false;
 $('#ai-to-note').addEventListener('click', async () => {
+  if (aiNoteSaving) return;
   const it = currentItem();
   if (!it) return toast('没有正在复习的题目', false);
   const text = ($('#ai-content').textContent || '').trim();
   if (!text) return toast('还没有可保存的解析', false);
   const q = it.q;
   if (!Array.isArray(q.notes)) q.notes = [];
-  q.notes.push({ text, created_at: new Date().toISOString() });
+  const note = { text, created_at: new Date().toISOString() };
+  q.notes.push(note);
+  aiNoteSaving = true;
+  $('#ai-to-note').disabled = true;
   try {
     await dbPut(q);
     renderReviewNote(q);
     closeAiModal();
     toast('已存为笔记，点铅笔可编辑');
   } catch (e) {
+    q.notes = q.notes.filter((n) => n !== note);
     toast('保存失败：' + e.message, false);
+  } finally {
+    aiNoteSaving = false;
+    $('#ai-to-note').disabled = false;
   }
 });
 $('#ai-close').addEventListener('click', closeAiModal);
