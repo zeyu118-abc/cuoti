@@ -1394,6 +1394,14 @@ $('#save-btn').addEventListener('click', async () => {
 
 // 录入表单“干净”快照：切页签前判断有没有未保存内容，避免手滑把整道题清空
 let inputSnapshot = '';
+let reviewNoteOriginal = '';
+function hasUnsavedReviewNote() {
+  try {
+    const ed = $('#review-note-editor');
+    return !!ed && !ed.classList.contains('hidden') &&
+      $('#review-note-text').value !== reviewNoteOriginal;
+  } catch (e) { return false; }
+}
 function inputStateSignature() {
   return JSON.stringify({
     id: state.editingId,
@@ -1410,7 +1418,7 @@ function markInputClean() {
   try { inputSnapshot = inputStateSignature(); } catch (e) { inputSnapshot = ''; }
 }
 function isInputDirty() {
-  try { return inputStateSignature() !== inputSnapshot; } catch (e) { return false; }
+  try { return inputStateSignature() !== inputSnapshot || hasUnsavedReviewNote(); } catch (e) { return false; }
 }
 
 function resetInput() {
@@ -1678,6 +1686,7 @@ function renderQuestion() {
   // 切题时收起上一条笔记的编辑器，避免上题的文字被存到下一题
   $('#review-note-editor').classList.add('hidden');
   $('#review-note-text').value = '';
+  reviewNoteOriginal = '';
 
   const labels = q.type === 'judge' ? ['A', 'B'] : ['A', 'B', 'C', 'D'];
   const optionsArr = Array.isArray(q.options) ? q.options : [];
@@ -2411,6 +2420,7 @@ $('#review-delete').addEventListener('click', async () => {
 $('#review-note-btn').addEventListener('click', () => {
   clearReviewAutoTimer();
   $('#review-note-text').value = '';
+  reviewNoteOriginal = '';
   $('#review-note-editor').classList.remove('hidden');
   $('#review-note-btn').classList.add('hidden');
   $('#review-edit-btn').classList.add('hidden');
@@ -2418,6 +2428,8 @@ $('#review-note-btn').addEventListener('click', () => {
 
 $('#review-note-cancel').addEventListener('click', () => {
   $('#review-note-editor').classList.add('hidden');
+  $('#review-note-text').value = '';
+  reviewNoteOriginal = '';
   $('#review-note-btn').classList.remove('hidden');
   $('#review-edit-btn').classList.remove('hidden');
 });
@@ -2439,6 +2451,7 @@ $('#review-note-save').addEventListener('click', async () => {
     await dbPut(q);
     toast('笔记已保存');
     $('#review-note-text').value = '';
+    reviewNoteOriginal = '';
     $('#review-note-editor').classList.add('hidden');
     $('#review-note-btn').classList.remove('hidden');
     $('#review-edit-btn').classList.remove('hidden');
