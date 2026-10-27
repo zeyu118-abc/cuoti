@@ -24,6 +24,8 @@ const reviewQueue = [];
 let reviewIndex = 0;
 let reviewTotal = 0;  // 本次会话的首次到期题数（答题卡序号上限）
 let isBrowsing = false; // 回看模式：做完所有题后从完成页「回看今日题目」进入，最后一道不再显示「完成」
+let isTrophyRedo = false; // 从完成页「回看今日错题」进入的重做模式：底部始终显示返回，直接回完成页
+let trophyRedoIds = []; // 完成页「今日错题」按钮对应的题目 id，重做答对后本次完成页仍保留入口
 let reviewSessionDate = ''; // 当前复习会话的日期。跨天时不能跟着系统日期变，否则会漏掉今天到期的题
 let reviewAutoTimer = null; // 复习答对后自动跳下一题的定时器
 const REVIEW_AUTO_NEXT_DELAY = 400; // 让「回答正确」先露一下，再自动跳题
@@ -1582,6 +1584,8 @@ async function loadReview() {
   $('#review-box').classList.add('hidden');
   $('#review-empty').classList.add('hidden');
   isBrowsing = false;
+  isTrophyRedo = false;
+  trophyRedoIds = [];
   const all = await dbGetAll();
   const today = fmtDate(new Date());
 
@@ -1671,7 +1675,8 @@ function nextButtonLabel() {
 // 统一刷新底部/侧边按钮的显示与文字
 function refreshBottomBar() {
   const hasPendingNow = reviewQueue.some((x) => x.status === 'pending');
-  $('#review-back').classList.toggle('hidden', hasPendingNow);
+  // 完成页「回看今日错题」是重做模式：即使还有待做也保留返回，随时回完成页
+  $('#review-back').classList.toggle('hidden', hasPendingNow && !isTrophyRedo);
   $('#next-question').classList.toggle('hidden', !shouldShowNext());
   const label = $('#next-question .side-label');
   if (label) label.textContent = nextButtonLabel();
@@ -1955,8 +1960,41 @@ function reviewNextHint(q) {
   return `将在 ${days} 天后复习（${q.next_review}）`;
 }
 
+// 完成页「回看今日错题」：把今天做错的题加入重做队列，进入重做模式。
+// 复用已有的待重做项，避免同一题因重复进入而堆出多条灰色序号。
+function openTrophyRedo(ids, all) {
+  const questions = ids
+    .map((id) => all.find((q) => q.id === id))
+    .filter(Boolean);
+  if (questions.length === 0) return toast('今天没有做错的题', false);
+
+  const targets = [];
+  questions.forEach((q) => {
+    let it = reviewQueue.find(
+      (x) => x.kind === 'redo' && x.status === 'pending' && x.q.id === q.id
+    );
+    if (!it) {
+      it = { q, status: 'pending', kind: 'redo', retry: false, selectedAnswer: [], prevSelected: null };
+      reviewQueue.push(it);
+    }
+    targets.push(it);
+  });
+
+  trophyRedoIds = questions.map((q) => q.id);
+  isBrowsing = false;
+  isTrophyRedo = true;
+  reviewSessionDate = fmtDate(new Date());
+  reviewIndex = reviewQueue.indexOf(targets[0]);
+  $('#review-empty').classList.add('hidden');
+  $('#review-box').classList.remove('hidden');
+  renderQuestion();
+  // 和回看一样压一个返回处理：点返回/手机返回都直接回完成页
+  pushBack(exitBrowse);
+}
+
 async function showReviewComplete() {
   clearReviewAutoTimer();
+  isTrophyRedo = false;
   let all;
   try {
     all = await dbGetAll();
@@ -1970,6 +2008,24 @@ async function showReviewComplete() {
   const doneAll = all.filter((q) => q.last_reviewed);
   const correctAll = doneAll.filter((q) => q.last_result === 'correct').length;
   const pct = (c, t) => (t === 0 ? 0 : Math.round((c / t) * 100));
+
+  // 今日错题：以数据库当前结果为主；本次从完成页重做过的题即使已经改对，
+  // 也保留在 trophyRedoIds 里，直到离开复习页，方便继续回看/再练。
+  const wrongIdSet = new Set([
+    ...doneToday.filter((q) => q.last_result === 'wrong').map((q) => q.id),
+    ...trophyRedoIds,
+  ]);
+  // 今天从完成页重做后，数据库里的 last_result 可能已经变对；
+  // 从今天保存的会话里补上“主题目曾做错”的记录，切走再回来入口也不丢。
+  const savedSession = getSavedSession();
+  if (savedSession && savedSession.date === today && Array.isArray(savedSession.items)) {
+    savedSession.items.forEach((s) => {
+      if (s && s.kind === 'main' && s.status === 'wrong' && all.some((q) => q.id === s.id)) {
+        wrongIdSet.add(s.id);
+      }
+    });
+  }
+  const wrongIds = Array.from(wrongIdSet).filter((id) => all.some((q) => q.id === id));
 
   // 题目被删光（比如唯一一题答对后删掉）时，别显示“今日做题 0 道”的奖杯页，回到普通空状态
   if (doneAll.length === 0 && reviewQueue.length === 0) {
@@ -1993,7 +2049,11 @@ async function showReviewComplete() {
     </div>
     <button id="review-again-btn" class="mt-6 w-full py-2.5 rounded-lg bg-primary-600 hover:bg-primary-700 text-white font-semibold transition">
       <i class="fa fa-history mr-1"></i>回看今日题目
-    </button>`;
+    </button>
+    ${wrongIds.length > 0 ? `
+    <button id="review-wrong-btn" class="mt-2 w-full py-2.5 rounded-lg bg-amber-500 hover:bg-amber-600 text-white font-semibold transition">
+      <i class="fa fa-rotate-left mr-1"></i>回看今日错题（${wrongIds.length}）
+    </button>` : ''}`;
   $('#review-count').textContent = '0';
   const badge = $('#due-badge');
   badge.textContent = '0';
@@ -2001,8 +2061,7 @@ async function showReviewComplete() {
 
   $('#review-again-btn').addEventListener('click', async () => {
     let mainItems = reviewQueue.filter((x) => x.kind === 'main');
-    if (mainItems.length === 0) {
-      let all;
+    if (mainItems.length === 0) {      let all;
       try {
         all = await dbGetAll();
       } catch (e) {
@@ -2040,6 +2099,7 @@ async function showReviewComplete() {
     }
     if (mainItems.length === 0) return toast('今天还没有做题记录', false);
     isBrowsing = true;
+    isTrophyRedo = false;
     reviewQueue.length = 0;
     mainItems.forEach((it) => reviewQueue.push(it));
     reviewTotal = mainItems.length;
@@ -2049,6 +2109,11 @@ async function showReviewComplete() {
     renderQuestion();
     pushBack(exitBrowse); // 回看时手机返回键/返回按钮都退回完成页
   });
+
+  const wrongBtn = $('#review-wrong-btn');
+  if (wrongBtn) {
+    wrongBtn.addEventListener('click', () => openTrophyRedo(wrongIds, all));
+  }
   saveSession();
 }
 
