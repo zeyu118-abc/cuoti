@@ -19,7 +19,7 @@ const state = {
 // 复习会话队列，每项 { q, status, kind, retry, order, labels, contents, currentAnswer, selectedAnswer }
 //   status: 'pending'未做 | 'correct'对 | 'wrong'错
 //   kind:   'main'首次复习 | 'redo'错题重做
-//   retry:  答题卡点进的手动重做（提交不改库、不追加）
+//   retry:  答题卡点进的手动重做（提交写对错统计，不改复习轮次/下次日期）
 const reviewQueue = [];
 let reviewIndex = 0;
 let reviewTotal = 0;  // 本次会话的首次到期题数（答题卡序号上限）
@@ -596,7 +596,8 @@ function normalizeLabel(raw) {
 
 // 备份导入与 JSON 录入共用：把答案统一成标签数组，支持数组、单个字母、合并串 "AC"/"A,C"/"A、C"
 function parseAnswerTokens(rawAnswer) {
-  if (Array.isArray(rawAnswer)) return rawAnswer.map((x) => String(x).trim());
+  // 数组里也可能有 "AC" / "A,C" 这种合并串，逐个再拆，避免整条答案被当成非法标签
+  if (Array.isArray(rawAnswer)) return rawAnswer.flatMap((x) => parseAnswerTokens(x));
   if (rawAnswer == null) return [];
   const s = String(rawAnswer).trim().toUpperCase();
   if (/^[A-D]{2,4}$/.test(s)) return s.split('');
@@ -1720,7 +1721,11 @@ function renderQuestion() {
     const imgHtml = opt.image ? `<img src="${escapeHtml(opt.image)}" class="mt-1 max-h-32 rounded-lg" alt="" />` : '';
     div.innerHTML = `<span class="badge">${escapeHtml(opt.label)}</span><span class="flex-1 min-w-0">${textHtml}${imgHtml}</span>`;
     if (canAnswer) {
-      div.addEventListener('click', () => {
+      // div 也能用键盘操作：Tab 聚焦，Enter/空格选择
+      div.tabIndex = 0;
+      div.setAttribute('role', 'button');
+      div.setAttribute('aria-pressed', selectedAnswer.includes(opt.label) ? 'true' : 'false');
+      const selectOption = () => {
         if (q.type === 'multiple') {
           it.selectedAnswer = it.selectedAnswer.includes(opt.label)
             ? it.selectedAnswer.filter((x) => x !== opt.label)
@@ -1728,9 +1733,18 @@ function renderQuestion() {
         } else {
           it.selectedAnswer = [opt.label];
         }
-        wrap.querySelectorAll('.review-opt').forEach((el) =>
-          el.classList.toggle('selected', it.selectedAnswer.includes(el.dataset.label))
-        );
+        wrap.querySelectorAll('.review-opt').forEach((el) => {
+          const on = it.selectedAnswer.includes(el.dataset.label);
+          el.classList.toggle('selected', on);
+          el.setAttribute('aria-pressed', on ? 'true' : 'false');
+        });
+      };
+      div.addEventListener('click', selectOption);
+      div.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          selectOption();
+        }
       });
     }
     wrap.appendChild(div);
@@ -3764,13 +3778,7 @@ function startBankQuiz(category) {
   const idx = (Number.isInteger(p) && p >= 0 && p < bankList.length) ? p : 0;
   if (p != null && p >= bankList.length) saveBankProgress(category, 0);
   bankIndex = idx;
-  // 进入后当前题重做：重置为未答，不管上次对错（历史对错仍保留在答题卡其他题上）
-  const cur = bankItems[bankIndex];
-  if (cur && cur.status !== null) {
-    cur.status = null;
-    cur.selected = [];
-    removeBankAnswer(bankCategory, bankList[bankIndex].bank_id);
-  }
+  // 进入后保留已答状态；要重做点结果区的「重做本题」，避免一进分类/看答题卡就抹掉记录
   $('#bank-categories').classList.add('hidden');
   $('#bank-quiz').classList.remove('hidden');
   pushBack(() => renderBankCategories());
@@ -3816,7 +3824,10 @@ function renderBankOptions(q, selected) {
     div.style.pointerEvents = answered ? 'none' : ''; // 已判分就锁住，避免事后改选造成“判分和画面对不上”
     div.innerHTML = `<span class="badge">${escapeHtml(opt.label)}</span><span class="flex-1 min-w-0"><div>${escapeHtml(opt.text || '')}</div></span>`;
     if (!answered) {
-      div.addEventListener('click', () => {
+      div.tabIndex = 0;
+      div.setAttribute('role', 'button');
+      div.setAttribute('aria-pressed', selected.includes(opt.label) ? 'true' : 'false');
+      const selectOption = () => {
         const item = bankItems[bankIndex];
         if (q.type === 'multiple') {
           item.selected = item.selected.includes(opt.label)
@@ -3825,9 +3836,18 @@ function renderBankOptions(q, selected) {
         } else {
           item.selected = [opt.label];
         }
-        wrap.querySelectorAll('.review-opt').forEach((el) =>
-          el.classList.toggle('selected', item.selected.includes(el.dataset.label))
-        );
+        wrap.querySelectorAll('.review-opt').forEach((el) => {
+          const on = item.selected.includes(el.dataset.label);
+          el.classList.toggle('selected', on);
+          el.setAttribute('aria-pressed', on ? 'true' : 'false');
+        });
+      };
+      div.addEventListener('click', selectOption);
+      div.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          selectOption();
+        }
       });
     }
     wrap.appendChild(div);
@@ -3851,6 +3871,21 @@ function renderBankAnsweredState() {
   result.innerHTML = correct
     ? `<div class="p-3 bg-emerald-50 border border-emerald-200 rounded-lg text-sm text-emerald-700"><i class="fa fa-check-circle mr-1"></i>回答正确</div>`
     : `<div class="p-3 bg-red-50 border border-red-200 rounded-lg text-sm text-red-700"><i class="fa fa-times-circle mr-1"></i>回答错误，正确答案：${escapeHtml(q.answer.join('、'))}</div>`;
+  const redo = document.createElement('button');
+  redo.type = 'button';
+  redo.id = 'bank-redo';
+  redo.className = 'mt-2 w-full py-2 rounded-lg border border-slate-300 text-sm font-semibold text-slate-600 hover:bg-slate-50 transition';
+  redo.innerHTML = '<i class="fa fa-rotate-left mr-1"></i>重做本题';
+  redo.addEventListener('click', () => {
+    clearBankAutoTimer();
+    const it = bankItems[bankIndex];
+    if (!it) return;
+    it.status = null;
+    it.selected = [];
+    removeBankAnswer(bankCategory, bankList[bankIndex].bank_id);
+    renderBankQuestion();
+  });
+  result.appendChild(redo);
   $('#bank-submit').classList.add('hidden');
 }
 
@@ -3888,11 +3923,11 @@ async function addToWrongBook(q) {
         created_at: new Date().toISOString(),
       };
       await dbAdd(newQ);
-    } else if (!existing.next_review) {
-      // 已掌握但在题库又做错：重新进入复习
+    } else {
+      // 题库里每次做错都累加错题次数，并回到第 0 轮、明天再复习
+      existing.wrong_count = (Number(existing.wrong_count) || 0) + 1;
       existing.review_stage = 0;
       existing.next_review = fmtDate(addDays(new Date(), INTERVALS[0]));
-      existing.wrong_count = (Number(existing.wrong_count) || 0) + 1;
       await dbPut(existing);
     }
     refreshBadge();
@@ -3987,13 +4022,7 @@ function renderBankAnswerSheet() {
       $('#answer-sheet-modal').classList.add('hidden');
       bankIndex = i;
       saveBankProgress(bankCategory, i);
-      // 点答题卡进入：已答的题重置为未答，允许重做
-      const it = bankItems[i];
-      if (it && it.status !== null) {
-        it.status = null;
-        it.selected = [];
-        removeBankAnswer(bankCategory, bankList[i].bank_id);
-      }
+      // 答题卡只负责跳转，不重置作答；重做走结果区的按钮
       renderBankQuestion();
     });
     grid.appendChild(btn);
@@ -4460,6 +4489,10 @@ $('#ai-modal').addEventListener('click', (e) => {
 
 // ============ 初始化 ============
 async function init() {
+  // 尽量让浏览器把 IndexedDB 当持久数据，降低系统自动清理导致错题丢失的概率
+  if (navigator.storage && typeof navigator.storage.persist === 'function') {
+    navigator.storage.persist().catch(() => {});
+  }
   initAiUnlock();
   updateAutoNextUI();
   setType('single');

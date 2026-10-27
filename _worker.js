@@ -30,6 +30,7 @@ function messageText(message) {
 
 const MAX_IMAGE_CHARS = 4 * 1024 * 1024;
 const MAX_TOTAL_IMAGE_CHARS = 16 * 1024 * 1024;
+const MAX_BODY_CHARS = 24 * 1024 * 1024;
 
 // 只接受压缩后的本地位图 data URL 或公网 http(s) 图片，其它一律丢弃
 function normalizeImage(value) {
@@ -50,9 +51,22 @@ export default {
     if (url.pathname === '/api/ai' || url.pathname === '/api/ai/') {
       return handleAI(request, env);
     }
+    // 未知 /api 路径不要被 Pages 的 SPA 回退成首页 HTML
+    if (url.pathname.startsWith('/api/')) {
+      return json({ error: '接口不存在' }, 404);
+    }
 
     // 其它请求照常返回网页静态文件
-    return env.ASSETS.fetch(request);
+    const asset = await env.ASSETS.fetch(request);
+    // 带扩展名的资源缺失时，Pages 可能回退 index.html；不能让浏览器把 HTML 当 JS/CSS
+    if (asset.status === 200 && /\.[a-z0-9]+$/i.test(url.pathname) &&
+        (asset.headers.get('content-type') || '').includes('text/html')) {
+      return new Response('Not found', {
+        status: 404,
+        headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' },
+      });
+    }
+    return asset;
   },
 };
 
@@ -85,7 +99,12 @@ async function handleAI(request, env) {
 
   let body;
   try {
-    body = await request.json();
+    // 先看 Content-Length；再对实际文本做一次上限检查，避免超大 JSON 占满 Worker 内存
+    const declared = Number(request.headers.get('content-length') || 0);
+    if (declared > MAX_BODY_CHARS) return json({ error: '请求体过大' }, 413);
+    const rawBody = await request.text();
+    if (rawBody.length > MAX_BODY_CHARS) return json({ error: '请求体过大' }, 413);
+    body = JSON.parse(rawBody);
   } catch {
     return json({ error: 'JSON 格式错误' }, 400);
   }
