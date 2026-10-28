@@ -1,6 +1,29 @@
 // ============ 常量与状态 ============
 const LABELS_ALL = ['A', 'B', 'C', 'D'];
 const LABELS_JUDGE = ['A', 'B'];
+
+// 导入题不一定都是四选项：2/3 选项的单选/多选也要能进错题本。
+// 有显式 A/B/C 标签时按标签；没有标签的数组按顺序取 A..；判断固定 A/B。
+function resolveOptionLabels(raw, type, rawOpts) {
+  if (type === 'judge') return LABELS_JUDGE;
+  let explicit = [];
+  if (Array.isArray(rawOpts)) {
+    explicit = rawOpts
+      .filter((o) => o && typeof o === 'object' && o.label != null)
+      .map((o) => normalizeLabel(String(o.label)))
+      .filter((l) => LABELS_ALL.includes(l));
+  } else if (rawOpts && typeof rawOpts === 'object') {
+    explicit = Object.keys(rawOpts)
+      .map((k) => normalizeLabel(k))
+      .filter((l) => LABELS_ALL.includes(l));
+  }
+  explicit = [...new Set(explicit)].sort();
+  if (explicit.length >= 2 && explicit.length <= 3) return explicit;
+  if (Array.isArray(rawOpts) && rawOpts.length >= 2 && rawOpts.length <= 3) {
+    return LABELS_ALL.slice(0, rawOpts.length);
+  }
+  return LABELS_ALL;
+}
 // 错题来源科目（手动录入题可选标签，共 8 科）
 const SUBJECTS = ['电路', '电机', '电分', '继保', '高压', '设备', '电力电子', '行测'];
 const INTERVALS = [1, 3, 7, 15, 30, 60]; // 艾宾浩斯复习间隔（天）
@@ -197,6 +220,7 @@ function saveSession() {
     // 用会话自己的日期，不要每次保存都改成“今天”：否则跨天后旧队列会被当成今天，今天的到期题就漏了
     date: reviewSessionDate || fmtDate(new Date()),
     atTrophy: sessionAtTrophy,
+    trophyRedo: isTrophyRedo,
     index: reviewIndex,
     items: reviewQueue.map((it) => ({
       id: it.q.id,
@@ -1380,8 +1404,16 @@ $('#save-btn').addEventListener('click', async () => {
       };
       const similar = findSimilar(newQuestion, await dbGetAll());
       if (similar) {
-        const keep = await askDuplicate(newQuestion, similar, '保存');
-        if (!keep) return toast('已取消保存', false);
+        const choice = await askDuplicate(newQuestion, similar, '保存');
+        if (choice === 'skip') return toast('已取消保存', false);
+        if (choice === 'retry') {
+          await dbPut(resetDuplicateForTomorrow(similar));
+          toast('已把重复题安排到明天重新复习，并记一次错');
+          resetInput();
+          loadList();
+          refreshBadge();
+          return;
+        }
       }
       await dbAdd(newQuestion);
       toast('保存成功，明日复习');
@@ -1504,6 +1536,22 @@ function findSimilar(q, all) {
   for (const existing of all) {
     // 判断与单选/多选题型不同，不可能是同一道题，直接跳过
     if ((q.type === 'judge') !== (existing.type === 'judge')) continue;
+    // 两边都有图但图不同，题干再像也不是同一题（例如同一题干配了不同电路图）
+    const qi = [q.question_image || ''].concat((Array.isArray(q.options) ? q.options : []).map((o) => (o && o.image) || ''));
+    const ei = [existing.question_image || ''].concat((Array.isArray(existing.options) ? existing.options : []).map((o) => (o && o.image) || ''));
+    let imageConflict = false;
+    for (let i = 0; i < Math.max(qi.length, ei.length); i++) {
+      if (qi[i] && ei[i] && qi[i] !== ei[i]) { imageConflict = true; break; }
+    }
+    if (imageConflict) continue;
+    const qStem = normalizeText(q.question_text), eStem = normalizeText(existing.question_text);
+    // 纯图片/无文字题：只有题干图完全相同才算同一题，不能因为两个空字符串相似度 1 就全部误报
+    if (!qStem || !eStem) {
+      if (!qStem && !eStem && q.question_image && existing.question_image && q.question_image === existing.question_image) {
+        if (1 > bestScore) { bestScore = 1; best = existing; }
+      }
+      continue;
+    }
     const stemScore = textSimilarity(q.question_text, existing.question_text);
     // 题干完全不像的，不必再比选项
     if (stemScore < 0.5) continue;
@@ -1526,6 +1574,14 @@ function isSameQuestionContent(a, b) {
     return !!(a.question_image && b.question_image && a.question_image === b.question_image);
   }
   if (na !== nb) return false;
+  // 题干/选项文字相同，但配图不同（例如同一题干配了不同电路图）不能合并；
+  // 一边有图、一边没图则视为同一题，合并时把缺的图补上。
+  const images = (q) => [q.question_image || '']
+    .concat((Array.isArray(q.options) ? q.options : []).map((o) => (o && o.image) || ''));
+  const ia = images(a), ib = images(b);
+  for (let i = 0; i < Math.max(ia.length, ib.length); i++) {
+    if (ia[i] && ib[i] && ia[i] !== ib[i]) return false;
+  }
   const opts = (q) => (Array.isArray(q.options) ? q.options : []).map((o) => {
     const text = normalizeText(typeof o === 'string' ? o : (o && o.text));
     return text || ('img:' + String(o && o.image || ''));
@@ -1553,6 +1609,15 @@ function mergeImportedQuestion(local, incoming) {
   // 同一道题在平板上可能是手动录入、在手机上是题库题；合并时保留题库来源，
   // 否则行测入口会少算一道，列表“全部”也会对不上。
   if (local.bank_id == null && incoming.bank_id != null) local.bank_id = incoming.bank_id;
+  // 手机端给题干/选项补的图，平板端没有时同步过来；文字已相同，不覆盖已有图。
+  if (!local.question_image && incoming.question_image) local.question_image = incoming.question_image;
+  if (Array.isArray(local.options) && Array.isArray(incoming.options)) {
+    local.options = local.options.map((o) => {
+      const src = incoming.options.find((x) => x && x.label === o.label);
+      if (src && !o.image && src.image) return { ...o, image: src.image };
+      return o;
+    });
+  }
   local.correct_count = Math.max(Number(local.correct_count) || 0, Number(incoming.correct_count) || 0);
   local.wrong_count = Math.max(Number(local.wrong_count) || 0, Number(incoming.wrong_count) || 0);
   if (!local.subject && incoming.subject) local.subject = incoming.subject;
@@ -1579,11 +1644,24 @@ function renderCompareBox(el, q, title) {
 }
 
 let dupResolve = null;
+
+// 重复题第三选择：把已录入的那道题当成“今天又做错一次”，
+// 轮次归零、明天重新开始，并清掉原下次复习日期。
+function resetDuplicateForTomorrow(q) {
+  q.review_stage = 0;
+  q.next_review = fmtDate(addDays(new Date(), 1));
+  q.wrong_count = (Number(q.wrong_count) || 0) + 1;
+  q.last_reviewed = fmtDate(new Date());
+  q.last_result = 'wrong';
+  return q;
+}
+
 function askDuplicate(newQ, oldQ, action) {
   return new Promise((resolve) => {
     renderCompareBox($('#dup-new'), newQ, action === '导入' ? '你正在导入的题目' : '你正在录入的题目');
     renderCompareBox($('#dup-old'), oldQ, '已录入的题目');
     $('#dup-keep').textContent = '不是同一题，仍要' + action;
+    $('#dup-retry').classList.remove('hidden');
     $('#dup-skip').textContent = action === '导入' ? '是同一题，跳过不导入' : '是同一题，取消保存';
     dupResolve = resolve;
     $('#dup-modal').classList.remove('hidden');
@@ -1591,11 +1669,15 @@ function askDuplicate(newQ, oldQ, action) {
 }
 $('#dup-keep').addEventListener('click', () => {
   $('#dup-modal').classList.add('hidden');
-  if (dupResolve) { dupResolve(true); dupResolve = null; }
+  if (dupResolve) { dupResolve('keep'); dupResolve = null; }
+});
+$('#dup-retry').addEventListener('click', () => {
+  $('#dup-modal').classList.add('hidden');
+  if (dupResolve) { dupResolve('retry'); dupResolve = null; }
 });
 $('#dup-skip').addEventListener('click', () => {
   $('#dup-modal').classList.add('hidden');
-  if (dupResolve) { dupResolve(false); dupResolve = null; }
+  if (dupResolve) { dupResolve('skip'); dupResolve = null; }
 });
 
 // ============ 复习 ============
@@ -1643,16 +1725,20 @@ async function loadReview() {
 
   // 优先恢复今天已保存的会话；没有或跨天则全新开始（每日顺序确定）
   const saved = getSavedSession();
+  const resumedTrophyRedo = !!(saved && saved.date === today && saved.trophyRedo === true);
   let resumedAtTrophy = false;
   if (!(saved && saved.date === today && restoreSession(saved, all))) {
     buildFreshSession(all, today);
     sessionAtTrophy = false;
+    isTrophyRedo = false;
   } else if (saved.atTrophy === true) {
     // 上次停在完成页；刷新/切回来仍显示奖杯，不能因为队列里还有重做项就自动进重做
     resumedAtTrophy = true;
     sessionAtTrophy = true;
+    isTrophyRedo = false;
   } else {
     sessionAtTrophy = false;
+    isTrophyRedo = resumedTrophyRedo;
   }
   ensureDoneToday(all, today);
   if (resumedAtTrophy) {
@@ -1761,8 +1847,14 @@ function renderQuestion() {
   $('#review-note-text').value = '';
   reviewNoteOriginal = '';
 
-  const labels = q.type === 'judge' ? ['A', 'B'] : ['A', 'B', 'C', 'D'];
   const optionsArr = Array.isArray(q.options) ? q.options : [];
+  // 2/3 选项题按实际选项标签渲染，不能固定成 A-D 后显示两个空选项。
+  const actualLabels = [...new Set(optionsArr.map((o) => o && o.label).filter(Boolean))].sort();
+  const labels = q.type === 'judge'
+    ? ['A', 'B']
+    : (actualLabels.length >= 2
+        ? actualLabels
+        : (optionsArr.length >= 2 ? LABELS_ALL.slice(0, optionsArr.length) : LABELS_ALL));
   const contents = labels.map((l) => {
     const o = optionsArr.find((x) => x && x.label === l) || {};
     return { text: o.text || '', image: o.image || '' };
@@ -2036,15 +2128,16 @@ function openTrophyRedo(ids, all) {
     .filter(Boolean);
   if (questions.length === 0) return toast('今天没有做错的题', false);
 
+  // 从奖杯页进入时重建重做队列：清掉旧的重做记录，避免同一题已有“已做”记录时，
+  // 答题卡多出旧序号（数量与今日错题数不一致），也避免刚进去就看到绿色/红色的已做状态。
+  for (let i = reviewQueue.length - 1; i >= 0; i--) {
+    if (reviewQueue[i].kind === 'redo') reviewQueue.splice(i, 1);
+  }
+
   const targets = [];
   questions.forEach((q) => {
-    let it = reviewQueue.find(
-      (x) => x.kind === 'redo' && x.status === 'pending' && x.q.id === q.id
-    );
-    if (!it) {
-      it = { q, status: 'pending', kind: 'redo', retry: false, selectedAnswer: [], prevSelected: null };
-      reviewQueue.push(it);
-    }
+    const it = { q, status: 'pending', kind: 'redo', retry: false, selectedAnswer: [], prevSelected: null };
+    reviewQueue.push(it);
     targets.push(it);
   });
 
@@ -3329,8 +3422,13 @@ $('#import-file').addEventListener('change', async () => {
           }
           const similar = findSimilar(q, existing);
           if (similar) {
-            const keep = await askDuplicate(q, similar, '导入');
-            if (!keep) { skipped++; continue; }
+            const choice = await askDuplicate(q, similar, '导入');
+            if (choice === 'skip') { skipped++; continue; }
+            if (choice === 'retry') {
+              await dbPut(resetDuplicateForTomorrow(similar));
+              updated++;
+              continue;
+            }
           }
           await dbAdd(q);
           existing.push(q);
@@ -3466,7 +3564,7 @@ async function importJsonArray(arr) {
   if (importBusy) throw new Error('正在导入，请稍候');
   importBusy = true;
   try {
-    let ok = 0, fail = 0, skipped = 0;
+    let ok = 0, fail = 0, skipped = 0, retried = 0;
     const existing = await dbGetAll();
     for (let i = 0; i < arr.length; i++) {
       try {
@@ -3474,8 +3572,13 @@ async function importJsonArray(arr) {
         await processQuestionImages(q);
         const similar = findSimilar(q, existing);
         if (similar) {
-          const keep = await askDuplicate(q, similar, '导入');
-          if (!keep) { skipped++; continue; }
+          const choice = await askDuplicate(q, similar, '导入');
+          if (choice === 'skip') { skipped++; continue; }
+          if (choice === 'retry') {
+            await dbPut(resetDuplicateForTomorrow(similar));
+            retried++;
+            continue;
+          }
         }
         await dbAdd(q);
         existing.push(q);
@@ -3485,8 +3588,8 @@ async function importJsonArray(arr) {
         console.warn('第 ' + (i + 1) + ' 题跳过：' + e.message);
       }
     }
-    if (ok > 0) {
-      toast('成功录入 ' + ok + ' 题' + (skipped > 0 ? '，跳过重复 ' + skipped + ' 题' : '') + (fail > 0 ? '，失败 ' + fail + ' 题' : ''));
+    if (ok > 0 || retried > 0) {
+      toast('成功录入 ' + ok + ' 题' + (retried > 0 ? '，重新安排 ' + retried + ' 题' : '') + (skipped > 0 ? '，跳过重复 ' + skipped + ' 题' : '') + (fail > 0 ? '，失败 ' + fail + ' 题' : ''));
       loadList();
       refreshBadge();
     } else if (skipped > 0) {
@@ -3580,7 +3683,7 @@ function normalizeQuestion(raw, idx) {
     }
   }
 
-  const labels = type === 'judge' ? LABELS_JUDGE : LABELS_ALL;
+  const labels = resolveOptionLabels(raw, type, raw.options);
 
   // 选项：支持数组 [{label,text,image}]、数组 [字符串]、对象 {A:'..', B:'..'}；字符串自动剥离 A./B./1. 前缀
   let options;
@@ -3678,7 +3781,7 @@ function sanitizeBackupQuestion(raw) {
       ? 'judge'
       : ((Array.isArray(raw.answer) && raw.answer.length >= 2) ? 'multiple' : 'single');
   }
-  const labels = type === 'judge' ? LABELS_JUDGE : LABELS_ALL;
+  const labels = resolveOptionLabels(raw, type, raw.options);
 
   // 答案：对/错文字转 A/B，全角字母与数字序号归一，过滤非法标签；
   // 与 JSON 录入共用 parseAnswerTokens，支持 "AC" / "A,C" 合并串，不再整条丢弃
@@ -3703,7 +3806,7 @@ function sanitizeBackupQuestion(raw) {
     if (rawOpts) {
       const o = useLabels
         ? rawOpts.find((x) => x && typeof x === 'object' && normalizeLabel(String(x.label || '')) === l)
-        : rawOpts[LABELS_ALL.indexOf(l)];
+        : rawOpts[labels.indexOf(l)];
       if (typeof o === 'string') return { text: o };
       if (o && typeof o === 'object') return o;
       return null;
