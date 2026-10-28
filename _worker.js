@@ -61,7 +61,9 @@ export default {
 
     // 交接/备份/构建文件即使被上传，也不允许公开访问
     if (path.startsWith('/.github') || path.startsWith('/.git') ||
-        /^\/(\.env|functions)(\/|$)/i.test(path) ||
+        /^\/\.env/i.test(path) ||
+        /^\/functions(\/|$)/i.test(path) ||
+        /\.(json|md|txt|log|patch)$/i.test(path) ||
         /\/(README\.md|backup-.*\.json|错题本备份-.*\.json|count-list-.*\.png|trophy-.*\.png)$/i.test(path)) {
       return new Response('Not found', { status: 404 });
     }
