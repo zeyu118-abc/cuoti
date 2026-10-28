@@ -44,28 +44,40 @@ function normalizeImage(value) {
   return '';
 }
 
+function normalizedPath(pathname) {
+  let path = pathname;
+  try {
+    path = decodeURIComponent(path);
+  } catch {
+    // 非法百分号编码保持原样，后面按原文判断
+  }
+  return path.replace(/\\/g, '/').replace(/\/{2,}/g, '/');
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    const path = normalizedPath(url.pathname);
 
     // 交接/备份/构建文件即使被上传，也不允许公开访问
-    if (url.pathname.startsWith('/.github') || url.pathname.startsWith('/.git') ||
-        /\/(README\.md|backup-.*\.json|错题本备份-.*\.json|count-list-.*\.png|trophy-.*\.png)$/i.test(url.pathname)) {
+    if (path.startsWith('/.github') || path.startsWith('/.git') ||
+        /^\/(\.env|functions)(\/|$)/i.test(path) ||
+        /\/(README\.md|backup-.*\.json|错题本备份-.*\.json|count-list-.*\.png|trophy-.*\.png)$/i.test(path)) {
       return new Response('Not found', { status: 404 });
     }
 
-    if (url.pathname === '/api/ai' || url.pathname === '/api/ai/') {
+    if (path === '/api/ai' || path === '/api/ai/') {
       return handleAI(request, env);
     }
     // 未知 /api 路径不要被 Pages 的 SPA 回退成首页 HTML
-    if (url.pathname === '/api' || url.pathname.startsWith('/api/')) {
+    if (path === '/api' || path.startsWith('/api/')) {
       return json({ error: '接口不存在' }, 404);
     }
 
     // 其它请求照常返回网页静态文件
     const asset = await env.ASSETS.fetch(request);
     // 带扩展名的资源缺失时，Pages 可能回退 index.html；不能让浏览器把 HTML 当 JS/CSS
-    if (asset.status === 200 && /\.[a-z0-9]+$/i.test(url.pathname) &&
+    if (asset.status === 200 && /\.[a-z0-9]+$/i.test(path) &&
         (asset.headers.get('content-type') || '').includes('text/html')) {
       return new Response('Not found', {
         status: 404,
