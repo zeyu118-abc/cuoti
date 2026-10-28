@@ -1631,6 +1631,92 @@ function mergeImportedQuestion(local, incoming) {
   local.notes = notes;
 }
 
+function questionContentKey(q) {
+  const stem = normalizeText(q.question_text) || ('img:' + String(q.question_image || ''));
+  const opts = (Array.isArray(q.options) ? q.options : []).map((o) => {
+    const text = normalizeText(typeof o === 'string' ? o : (o && o.text));
+    return text || ('img:' + String(o && o.image || ''));
+  }).filter(Boolean).sort();
+  return [q.type || '', stem, opts.join('\u0001')].join('\u0002');
+}
+
+function answerKey(q) {
+  return (Array.isArray(q.answer) ? q.answer : []).map((x) => String(x).toUpperCase()).sort().join('');
+}
+
+function dedupeKeeper(group) {
+  return group.slice().sort((a, b) => {
+    const la = a.last_reviewed || '', lb = b.last_reviewed || '';
+    if (la !== lb) return lb.localeCompare(la);
+    const sa = Number(a.review_stage) || 0, sb = Number(b.review_stage) || 0;
+    if (sa !== sb) return sb - sa;
+    const ca = (Number(a.correct_count) || 0) + (Number(a.wrong_count) || 0);
+    const cb = (Number(b.correct_count) || 0) + (Number(b.wrong_count) || 0);
+    if (ca !== cb) return cb - ca;
+    return String(a.created_at || '').localeCompare(String(b.created_at || ''));
+  })[0];
+}
+
+// 找出“题干 + 选项完全相同”的重复题；答案不同的不自动合并，避免把错题答案改掉。
+function findDuplicateGroups(all) {
+  const buckets = new Map();
+  all.forEach((q) => {
+    const key = questionContentKey(q);
+    if (!buckets.has(key)) buckets.set(key, []);
+    buckets.get(key).push(q);
+  });
+  const groups = [];
+  for (const bucket of buckets.values()) {
+    if (bucket.length < 2) continue;
+    const clusters = [];
+    for (const q of bucket) {
+      let placed = false;
+      for (const cluster of clusters) {
+        const rep = cluster[0];
+        if (!isSameQuestionContent(rep, q)) continue;
+        const ra = answerKey(rep), qa = answerKey(q);
+        if (ra && qa && ra !== qa) continue;
+        cluster.push(q); placed = true; break;
+      }
+      if (!placed) clusters.push([q]);
+    }
+    clusters.forEach((c) => { if (c.length > 1) groups.push(c); });
+  }
+  return groups;
+}
+
+async function dedupeQuestions() {
+  const groups = findDuplicateGroups(await dbGetAll());
+  if (!groups.length) { toast('没有发现可安全合并的重复题'); return; }
+  const total = groups.reduce((n, g) => n + g.length, 0);
+  const ok = confirm(`发现 ${groups.length} 组重复题（共 ${total} 道）。\n\n会保留每组的 1 道，合并复习进度/对错次数/笔记/图片，删除其余 ${total - groups.length} 道。\n\n建议先导出备份。确定合并吗？`);
+  if (!ok) return;
+  let removed = 0, failed = 0;
+  for (const group of groups) {
+    const keeper = dedupeKeeper(group);
+    for (const other of group) {
+      if (other === keeper) continue;
+      mergeImportedQuestion(keeper, other);
+      if (!keeper.answer || !keeper.answer.length) {
+        if (Array.isArray(other.answer) && other.answer.length) keeper.answer = other.answer.slice();
+      }
+      removed++;
+    }
+    try {
+      await dbPut(keeper);
+      for (const other of group) {
+        if (other === keeper) continue;
+        await dbDelete(other.id);
+      }
+    } catch (e) {
+      console.error('dedupe failed', e);
+      failed++;
+    }
+  }
+  await loadList();
+  toast(`已合并 ${groups.length - failed} 组，删除 ${removed} 道重复题${failed ? `，${failed} 组失败` : ''}`);
+}
+
 function renderCompareBox(el, q, title) {
   const typeText = q.type === 'single' ? '单选' : q.type === 'multiple' ? '多选' : '判断';
   const opts = (q.options || []).map((o) => `${escapeHtml(o.label || '?')}. ${escapeHtml(o.text || '（图片）')}`).join('<br>');
@@ -2812,6 +2898,7 @@ async function loadList() {
   $('#batch-btn').innerHTML = listSelectMode
     ? '<i class="fa fa-times mr-1"></i>退出删除'
     : '<i class="fa fa-trash-o mr-1"></i>删除题目';
+  $('#dedupe-btn').classList.toggle('hidden', listSelectMode);
   $('#batch-count').textContent = selectedIds.size;
 }
 
@@ -3061,6 +3148,14 @@ $('#batch-btn').addEventListener('click', () => {
   selectedIds.clear();
   loadList();
   if (listSelectMode) window.scrollTo(0, 0);
+});
+
+$('#dedupe-btn').addEventListener('click', async () => {
+  try {
+    await dedupeQuestions();
+  } catch (e) {
+    toast('清理失败：' + e.message, false);
+  }
 });
 
 // 搜索防抖：每敲一个字都全量读库会卡，等 250ms 再查
