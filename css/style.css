@@ -83,9 +83,9 @@ button:disabled {
   transition: all 0.15s;
   -webkit-tap-highlight-color: transparent;
 }
+/* 只在真正悬停时改边框；不再加浅绿底色，避免手机点按后 :hover 残留 */
 .review-opt:hover {
   border-color: #aad9d2;
-  background: #e6f2f0;
 }
 .review-opt.selected {
   border-color: #00705f;

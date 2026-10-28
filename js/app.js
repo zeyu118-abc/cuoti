@@ -26,6 +26,7 @@ let reviewTotal = 0;  // 本次会话的首次到期题数（答题卡序号上�
 let isBrowsing = false; // 回看模式：做完所有题后从完成页「回看今日题目」进入，最后一道不再显示「完成」
 let isTrophyRedo = false; // 从完成页「回看今日错题」进入的重做模式：底部始终显示返回，直接回完成页
 let trophyRedoIds = []; // 完成页「今日错题」按钮对应的题目 id，重做答对后本次完成页仍保留入口
+let sessionAtTrophy = false; // 当前会话停在完成页：刷新后仍显示奖杯，而不是误入错题重做
 let reviewSessionDate = ''; // 当前复习会话的日期。跨天时不能跟着系统日期变，否则会漏掉今天到期的题
 let reviewAutoTimer = null; // 复习答对后自动跳下一题的定时器
 const REVIEW_AUTO_NEXT_DELAY = 400; // 让「回答正确」先露一下，再自动跳题
@@ -195,6 +196,7 @@ function saveSession() {
   const session = {
     // 用会话自己的日期，不要每次保存都改成“今天”：否则跨天后旧队列会被当成今天，今天的到期题就漏了
     date: reviewSessionDate || fmtDate(new Date()),
+    atTrophy: sessionAtTrophy,
     index: reviewIndex,
     items: reviewQueue.map((it) => ({
       id: it.q.id,
@@ -1514,6 +1516,56 @@ function findSimilar(q, all) {
   return best && bestScore >= DUP_THRESHOLD ? best : null;
 }
 
+// 备份同步用：题干和选项都相同，视为同一道题（选项顺序、A/B/C/D 标签可不同），
+// 直接合并复习状态；只有“像但不是同一题”才走相似题确认。
+function isSameQuestionContent(a, b) {
+  if (!a || !b) return false;
+  if ((a.type === 'judge') !== (b.type === 'judge')) return false;
+  const na = normalizeText(a.question_text), nb = normalizeText(b.question_text);
+  if (!na || !nb) {
+    return !!(a.question_image && b.question_image && a.question_image === b.question_image);
+  }
+  if (na !== nb) return false;
+  const opts = (q) => (Array.isArray(q.options) ? q.options : []).map((o) => {
+    const text = normalizeText(typeof o === 'string' ? o : (o && o.text));
+    return text || ('img:' + String(o && o.image || ''));
+  }).filter(Boolean).sort();
+  const aa = opts(a), bb = opts(b);
+  if (aa.length !== bb.length) return false;
+  for (let i = 0; i < aa.length; i++) if (aa[i] !== bb[i]) return false;
+  return true;
+}
+
+function mergeImportedQuestion(local, incoming) {
+  const localLast = local.last_reviewed || '';
+  const incomingLast = incoming.last_reviewed || '';
+  const localStage = Number(local.review_stage) || 0;
+  const incomingStage = Number(incoming.review_stage) || 0;
+  // 以“最后一次复习时间”判断哪边更新；日期相同再看轮次，避免把平板上的旧状态覆盖手机上的新状态。
+  const incomingNewer = incomingLast > localLast
+    || (incomingLast === localLast && incomingStage > localStage);
+  if (incomingNewer) {
+    local.review_stage = incomingStage;
+    local.next_review = incoming.next_review || '';
+    local.last_reviewed = incomingLast;
+    local.last_result = incoming.last_result || '';
+  }
+  // 同一道题在平板上可能是手动录入、在手机上是题库题；合并时保留题库来源，
+  // 否则行测入口会少算一道，列表“全部”也会对不上。
+  if (local.bank_id == null && incoming.bank_id != null) local.bank_id = incoming.bank_id;
+  local.correct_count = Math.max(Number(local.correct_count) || 0, Number(incoming.correct_count) || 0);
+  local.wrong_count = Math.max(Number(local.wrong_count) || 0, Number(incoming.wrong_count) || 0);
+  if (!local.subject && incoming.subject) local.subject = incoming.subject;
+  if (!local.note && incoming.note) local.note = incoming.note;
+  const notes = Array.isArray(local.notes) ? local.notes.slice() : [];
+  const seen = new Set(notes.map((n) => JSON.stringify(n)));
+  (Array.isArray(incoming.notes) ? incoming.notes : []).forEach((n) => {
+    const key = JSON.stringify(n);
+    if (!seen.has(key)) { seen.add(key); notes.push(n); }
+  });
+  local.notes = notes;
+}
+
 function renderCompareBox(el, q, title) {
   const typeText = q.type === 'single' ? '单选' : q.type === 'multiple' ? '多选' : '判断';
   const opts = (q.options || []).map((o) => `${escapeHtml(o.label || '?')}. ${escapeHtml(o.text || '（图片）')}`).join('<br>');
@@ -1591,10 +1643,24 @@ async function loadReview() {
 
   // 优先恢复今天已保存的会话；没有或跨天则全新开始（每日顺序确定）
   const saved = getSavedSession();
+  let resumedAtTrophy = false;
   if (!(saved && saved.date === today && restoreSession(saved, all))) {
     buildFreshSession(all, today);
+    sessionAtTrophy = false;
+  } else if (saved.atTrophy === true) {
+    // 上次停在完成页；刷新/切回来仍显示奖杯，不能因为队列里还有重做项就自动进重做
+    resumedAtTrophy = true;
+    sessionAtTrophy = true;
+  } else {
+    sessionAtTrophy = false;
   }
   ensureDoneToday(all, today);
+  if (resumedAtTrophy) {
+    await updateReviewStats();
+    refreshBadge();
+    showReviewComplete();
+    return;
+  }
 
   const totalPending = reviewQueue.filter((x) => x.status === 'pending').length;
   $('#review-count').textContent = pendingMainCount();
@@ -1609,9 +1675,11 @@ async function loadReview() {
     } else {
       isBrowsing = false; // 正常复习（还有待做题）
       if (reviewIndex >= reviewQueue.length) reviewIndex = 0;
-      // 已答过的当前题保持“已判分”状态，不自动变成可重答。
-      // 需要重做时从答题卡进入（enterRedo），避免切页签就重复累计答对/答错次数。
-      renderQuestion();
+      // 刷新时如果停在已答过的题上，恢复原来的“重做”入口；
+      // 重做不再累计统计，所以不会因为刷新多算一次。
+      const cur = currentItem();
+      if (cur && cur.status !== 'pending') enterRedo(reviewIndex);
+      else renderQuestion();
     }
   } else {
     const doneToday = all.filter((q) => q.last_reviewed === today).length;
@@ -1983,11 +2051,13 @@ function openTrophyRedo(ids, all) {
   trophyRedoIds = questions.map((q) => q.id);
   isBrowsing = false;
   isTrophyRedo = true;
+  sessionAtTrophy = false;
   reviewSessionDate = fmtDate(new Date());
   reviewIndex = reviewQueue.indexOf(targets[0]);
   $('#review-empty').classList.add('hidden');
   $('#review-box').classList.remove('hidden');
   renderQuestion();
+  saveSession();
   // 和回看一样压一个返回处理：点返回/手机返回都直接回完成页
   pushBack(exitBrowse);
 }
@@ -2034,6 +2104,7 @@ async function showReviewComplete() {
     return;
   }
 
+  sessionAtTrophy = true;
   $('#review-box').classList.add('hidden');
   $('#review-empty').classList.remove('hidden');
   $('#review-empty').innerHTML = `
@@ -2212,40 +2283,10 @@ async function submitCurrentAnswer() {
     it.prevState = prevState;
     // 这一轮重新开始，之前的“上次选择”已失效；重做时 enterRedo 会重新记
     it.prevSelected = null;
-  } else if (isManualRetry) {
-    // 答题卡「手动重做」也算一次真实作答：更新对错次数与上次结果，
-    // 但不改复习轮次/下次日期（本次复习今天已经结算过，重做只是补练）
-    const q = it.q;
-    const changes = {
-      last_reviewed: fmtDate(new Date()),
-      last_result: correct ? 'correct' : 'wrong',
-      correct_count: (Number(q.correct_count) || 0) + (correct ? 1 : 0),
-      wrong_count: (Number(q.wrong_count) || 0) + (correct ? 0 : 1),
-    };
-    try {
-      await dbPut({ ...q, ...changes });
-    } catch (e) {
-      setReviewOptionsLocked(false);
-      toast('保存失败：' + e.message, false);
-      return;
-    }
-    Object.assign(q, changes);
   }
 
   it.status = correct ? 'correct' : 'wrong';
   it.retry = false;
-
-  // 手动重做答对：这道题对应的待重做项已经完成，删掉，避免答题卡还留一条“待做”
-  if (correct && it.kind === 'main') {
-    for (let i = reviewQueue.length - 1; i >= 0; i--) {
-      const x = reviewQueue[i];
-      if (x.kind === 'redo' && x.q.id === it.q.id && x.status === 'pending') {
-        reviewQueue.splice(i, 1);
-        if (i < reviewIndex) reviewIndex--;
-      }
-    }
-    if (reviewIndex >= reviewQueue.length) reviewIndex = Math.max(0, reviewQueue.length - 1);
-  }
 
   // 做错：队尾追加一次重做；手动重做答错时，若已有待重做项就不重复加
   const hasPendingRedoForQ = reviewQueue.some(
@@ -2654,14 +2695,14 @@ async function loadList() {
 
   currentFullList = fullList;
   currentPageList = pageList;
-  // 数量口径：当前列表显示多少题就写多少题；纯主列表再额外显示「全部手动题」总数，
-  // 避免「共 10 题」但只看到 2 张卡片、或设科目后总数突然变少。
+  // 数量口径：当前列表显示多少题就写多少题；纯主列表再额外显示「全部」总数。
+  // “全部”必须包含行测题库错题，否则主列表总数会永远比科目入口少一截。
   const isPlainAll = listView.mode === 'all' && !listKeyword && listView.typeFilter === 'all';
-  const allManualCount = all.filter((q) => q.bank_id == null).length;
+  const allWrongCount = all.length;
   $('#list-total-label').textContent = isPlainAll ? '未分类' : '共';
   $('#list-total').textContent = fullList.length;
   $('#list-total-all-wrap').classList.toggle('hidden', !isPlainAll);
-  $('#list-total-all').textContent = allManualCount;
+  $('#list-total-all').textContent = allWrongCount;
   renderListCards(pageList);
   let emptyText = '';
   if (listKeyword) emptyText = '没有找到匹配的题目';
@@ -2813,7 +2854,8 @@ function renderSubjectEntries(all) {
 
 function renderBankEntryCount(all) {
   const n = (all || []).filter((q) => q.bank_id != null || q.subject === '行测').length;
-  $('#bank-entry-count').textContent = n > 0 ? `${n} 题` : '';
+  // 0 题也要显示“0 题”，否则行测入口看起来像没加载出来。
+  $('#bank-entry-count').textContent = `${n} 题`;
 }
 
 // ============ 快捷设置科目 ============
@@ -3247,7 +3289,7 @@ $('#import-file').addEventListener('change', async () => {
   if (importBusy) return toast('正在导入，请稍候', false);
   importBusy = true;
 
-  let total = 0, skipped = 0, failed = 0;
+  let total = 0, updated = 0, skipped = 0, failed = 0;
   try {
     const existing = await dbGetAll();
     const today = fmtDate(new Date());
@@ -3273,12 +3315,17 @@ $('#import-file').addEventListener('change', async () => {
           const q = sanitizeBackupQuestion(rest);
           // 导入的图片也做「白底 + 去黑边」处理，和 JSON 录入一致
           await processQuestionImages(q);
-          // 清空「上次复习」临时状态，避免备份里别的设备今天的记录污染本设备的统计
-          q.last_reviewed = '';
-          q.last_result = '';
           // 今日复习会话已开始时，导入的到期题推迟到明天，避免打乱今日队列与答题卡
           if (q.next_review && q.next_review <= today && sessionToday) {
             q.next_review = fmtDate(addDays(new Date(), 1));
+          }
+          // 备份同步：题干+选项完全相同的题，不弹“相似题”，直接把复习状态合并到本机。
+          const same = existing.find((item) => isSameQuestionContent(q, item));
+          if (same) {
+            mergeImportedQuestion(same, q);
+            await dbPut(same);
+            updated++;
+            continue;
           }
           const similar = findSimilar(q, existing);
           if (similar) {
@@ -3296,12 +3343,13 @@ $('#import-file').addEventListener('change', async () => {
     }
 
     const parts = ['成功导入 ' + total + ' 题'];
+    if (updated > 0) parts.push('更新 ' + updated + ' 题');
     if (skipped > 0) parts.push('跳过重复 ' + skipped + ' 题');
     if (failed > 0) parts.push('跳过无效 ' + failed + ' 题');
-    if (total === 0 && skipped === 0 && failed === 0) {
+    if (total === 0 && updated === 0 && skipped === 0 && failed === 0) {
       toast('文件里没有题目', false);
     } else {
-      toast(parts.join('，'), total > 0);
+      toast(parts.join('，'), total > 0 || updated > 0);
     }
     loadList();
     refreshBadge();
