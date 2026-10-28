@@ -48,6 +48,12 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
+    // 交接/备份/构建文件即使被上传，也不允许公开访问
+    if (url.pathname.startsWith('/.github') || url.pathname.startsWith('/.git') ||
+        /\/(README\.md|backup-.*\.json|错题本备份-.*\.json|count-list-.*\.png|trophy-.*\.png)$/i.test(url.pathname)) {
+      return new Response('Not found', { status: 404 });
+    }
+
     if (url.pathname === '/api/ai' || url.pathname === '/api/ai/') {
       return handleAI(request, env);
     }
