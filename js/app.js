@@ -144,7 +144,21 @@ function openDB() {
   return dbPromise;
 }
 
+function isQuestionContentComplete(q) {
+  if (!q || typeof q !== 'object') return false;
+  if (!['single', 'multiple', 'judge'].includes(q.type)) return false;
+  const hasStem = String(q.question_text || '').trim().length > 0 || !!q.question_image;
+  if (!hasStem) return false;
+  const options = Array.isArray(q.options) ? q.options : [];
+  if (options.length < 2 || options.length > 4) return false;
+  if (options.some((o) => !o || (!String(o.text || '').trim() && !o.image))) return false;
+  const labels = new Set(options.map((o) => String(o.label || '')));
+  if (!Array.isArray(q.answer) || q.answer.length === 0) return false;
+  return q.answer.every((a) => labels.has(String(a)));
+}
+
 async function dbAdd(q) {
+  if (!isQuestionContentComplete(q)) throw new Error('题目内容不完整，不能保存');
   const db = await openDB();
   return new Promise((resolve, reject) => {
     const tx = db.transaction('questions', 'readwrite');
@@ -155,6 +169,7 @@ async function dbAdd(q) {
   });
 }
 async function dbPut(q) {
+  if (!isQuestionContentComplete(q)) throw new Error('题目内容不完整，不能保存');
   const db = await openDB();
   return new Promise((resolve, reject) => {
     const tx = db.transaction('questions', 'readwrite');
@@ -1166,16 +1181,22 @@ function loadQuestionToInput(q, returnTo) {
   editFromRedo = !!(cur && cur.kind === 'redo');
   state.editingId = q.id;
   state.type = ['single', 'multiple', 'judge'].includes(q.type) ? q.type : 'single';
-  const editLabels = state.type === 'judge' ? LABELS_JUDGE : LABELS_ALL;
-  state.answer = Array.isArray(q.answer) ? q.answer.filter((a) => editLabels.includes(a)) : [];
+  const optArr = Array.isArray(q.options) ? q.options : [];
+  // 编辑时统一映射到表单的 A/B/C/D 顺序：显式 C/D 标签的历史题也能正常改，
+  // 保存后标签会规范成 A..，但文字、图片和正确答案不会丢。
+  const sourceLabels = resolveOptionLabels(q, state.type, optArr);
+  const formLabels = state.type === 'judge' ? LABELS_JUDGE : LABELS_ALL;
+  state.answer = (Array.isArray(q.answer) ? q.answer : [])
+    .map((a) => sourceLabels.indexOf(normalizeLabel(String(a))))
+    .filter((i) => i >= 0 && i < formLabels.length)
+    .map((i) => formLabels[i]);
   state.questionImage = typeof q.question_image === 'string' ? q.question_image : '';
   state.byType = {};
   state.subject = SUBJECTS.includes(q.subject) ? q.subject : null;
 
   const labels = getLabels();
-  const optArr = Array.isArray(q.options) ? q.options : [];
-  state.options = labels.map((l) => {
-    const o = optArr.find((x) => x && x.label === l) || {};
+  state.options = labels.map((l, i) => {
+    const o = optArr.find((x) => x && x.label === sourceLabels[i]) || {};
     return { text: String(o.text || ''), image: typeof o.image === 'string' ? o.image : '' };
   });
 
@@ -1450,6 +1471,11 @@ $('#save-btn').addEventListener('click', async () => {
 // 录入表单“干净”快照：切页签前判断有没有未保存内容，避免手滑把整道题清空
 let inputSnapshot = '';
 let reviewNoteOriginal = '';
+function confirmReviewNoteLeave() {
+  if (!hasUnsavedReviewNote()) return true;
+  return confirm('这道题的笔记还没保存，确定要切换到别的题吗？');
+}
+
 function hasUnsavedReviewNote() {
   try {
     const ed = $('#review-note-editor');
@@ -1732,15 +1758,19 @@ let dupResolve = null;
 let dupForceChoice = 'keep';
 
 // 重复题第三选择：把已录入的那道题当成“又做错一次”，
-// 轮次归零、明天重新开始；这不是今天真正作答，不能写 last_reviewed/last_result，
-// 否则会被“今日已复习/今日正确率”当成今天做过。
+// 轮次归零、明天重新开始。今天已经做过的记录保留，不能因为重新排期
+// 把“今日做题/正确率/错题”抹掉；没做过的题本来就没有记录。
 function resetDuplicateForTomorrow(q) {
   q.review_stage = 0;
   q.next_review = fmtDate(addDays(new Date(), 1));
   q.wrong_count = (Number(q.wrong_count) || 0) + 1;
-  q.last_reviewed = '';
-  q.last_result = '';
   return q;
+}
+
+// 只有今天还没做过的题，才需要从今日队列移除；今天已做过的保留结果视图。
+function removeDuplicateFromTodayQueue(q) {
+  if (!q || q.last_reviewed === fmtDate(new Date())) return;
+  removeQuestionFromQueue(q.id);
 }
 
 function askDuplicate(newQ, oldQ, action, exact = false) {
@@ -1853,10 +1883,9 @@ async function loadReview() {
     } else {
       isBrowsing = resumedBrowsing; // 回看中刷新/切页签，回到原来那一题
       if (reviewIndex >= reviewQueue.length) reviewIndex = 0;
-      // 刷新时如果停在已答过的题上，恢复原来的“重做”入口；
-      // 重做不再累计统计，所以不会因为刷新多算一次。回看态保持只读，不自动进重做。
-      const cur = currentItem();
-      if (!isBrowsing && cur && cur.status !== 'pending') enterRedo(reviewIndex);
+      // 刷新/切页签回到已判分的题：按用户要求直接进入这道题的重做（可再次作答），
+      // 不再只恢复只读结果视图；回看模式仍是只读浏览。
+      if (!isBrowsing && reviewQueue[reviewIndex].status !== 'pending') enterRedo(reviewIndex);
       else renderQuestion();
     }
   } else {
@@ -1995,7 +2024,7 @@ function renderQuestion() {
   // 渲染选项（顺序固定，来自 it.order）
   const wrap = $('#review-options');
   wrap.innerHTML = '';
-  const canAnswer = it.status === 'pending' || it.retry === true;
+  const canAnswer = !isBrowsing && (it.status === 'pending' || it.retry === true);
 
   const displayOptions = labels.map((label, pos) => ({
     label,
@@ -2515,6 +2544,7 @@ function advanceReview() {
   clearReviewAutoTimer();
   const n = reviewQueue.length;
   if (n === 0) return;
+  if (!confirmReviewNoteLeave()) return;
 
   // 回看模式：按顺序浏览已做过的题
   if (isBrowsing) {
@@ -2572,6 +2602,7 @@ $('#next-question').addEventListener('click', advanceReview);
 $('#prev-question').addEventListener('click', () => {
   const it = reviewQueue[reviewIndex];
   if (!it) return;
+  if (!confirmReviewNoteLeave()) return;
   // 上一题：只在同一阶段（主复习 / 错题重做）内向前翻，不回退到主题目
   for (let i = reviewIndex - 1; i >= 0; i--) {
     if (reviewQueue[i].kind === it.kind) {
@@ -2586,6 +2617,7 @@ $('#prev-question').addEventListener('click', () => {
 // ============ 答题卡 ============
 function enterRedo(index) {
   const it = reviewQueue[index];
+  if (!isBrowsing && !confirmReviewNoteLeave()) return;
   // 回看是只读浏览，点已答卡只跳过去看结果，不能再进入重做/追加错题。
   if (isBrowsing) {
     reviewIndex = index;
@@ -2624,6 +2656,7 @@ function renderAnswerSheet() {
       else if (it.status === 'wrong') btn.className = 'h-11 rounded-lg font-semibold text-sm bg-red-500 text-white';
       else btn.className = 'h-11 rounded-lg font-semibold text-sm bg-slate-200 text-slate-500';
       btn.addEventListener('click', () => {
+        if (!confirmReviewNoteLeave()) return;
         $('#answer-sheet-modal').classList.add('hidden');
         reviewIndex = reviewQueue.indexOf(it);
         renderQuestion();
@@ -2647,6 +2680,7 @@ function renderAnswerSheet() {
         $('#answer-sheet-modal').classList.add('hidden');
         const idx = reviewQueue.indexOf(it);
         if (it.status === 'pending') {
+          if (!confirmReviewNoteLeave()) return;
           reviewIndex = idx;
           renderQuestion();
         } else {
@@ -2947,7 +2981,7 @@ function renderListCards(list) {
           <p class="text-sm font-medium whitespace-pre-wrap">${escapeHtml(q.question_text) || '（图片题）'}</p>
         </div>
         <div class="flex items-center gap-3 shrink-0">
-          ${listSelectMode ? '' : `${listView.mode === 'all' && q.bank_id == null ? `<button class="subject-btn text-slate-400 hover:text-primary-500 transition" data-id="${q.id}" title="设置科目"><i class="fa fa-tag"></i></button>` : ''}<i class="fa fa-chevron-right text-slate-400 text-sm"></i><button class="del-btn text-slate-400 hover:text-red-500 transition" data-id="${q.id}" title="删除"><i class="fa fa-trash-o"></i></button>`}
+          ${listSelectMode ? '' : `${listView.mode === 'all' && q.bank_id == null ? `<button class="subject-btn text-slate-400 hover:text-primary-500 transition" data-id="${q.id}" title="设置科目"><i class="fa fa-tag"></i></button>` : ''}<i class="fa fa-chevron-right text-slate-400 text-sm"></i>`}
         </div>
       </div>
     `;
@@ -2960,22 +2994,6 @@ function renderListCards(list) {
 
     wrap.appendChild(card);
   });
-
-  wrap.querySelectorAll('.del-btn').forEach((btn) =>
-    btn.addEventListener('click', async () => {
-      if (!confirm('确定删除这道错题吗？')) return;
-      try {
-        await dbDelete(Number(btn.dataset.id));
-        removeQuestionFromQueue(Number(btn.dataset.id));
-        saveSession();
-        toast('已删除');
-        loadList();
-        refreshBadge();
-      } catch (e) {
-        toast(e.message, false);
-      }
-    })
-  );
 
   wrap.querySelectorAll('.subject-btn').forEach((btn) =>
     btn.addEventListener('click', (e) => {
@@ -3002,6 +3020,7 @@ function renderTypeTabs(container, currentType) {
     btn.addEventListener('click', () => {
       listView.typeFilter = t.key;
       listView.page = 1;
+      listPageBackCount = 0; // 筛选后页码重置，旧的分页返回栈也要丢弃
       selectedIds.clear(); // 筛选后不可见的勾选不能带到下一次批量删除
       loadList();
       window.scrollTo(0, 0);
@@ -3180,6 +3199,7 @@ let listSearchTimer = null;
 $('#list-search').addEventListener('input', (e) => {
   listKeyword = e.target.value.trim();
   listView.page = 1;
+  listPageBackCount = 0;
   selectedIds.clear();
   clearTimeout(listSearchTimer);
   listSearchTimer = setTimeout(() => {
@@ -3193,6 +3213,7 @@ $('#list-search-clear').addEventListener('click', () => {
   listKeyword = '';
   $('#list-search').value = '';
   listView.page = 1;
+  listPageBackCount = 0;
   selectedIds.clear();
   loadList();
 });
@@ -3298,6 +3319,7 @@ document.addEventListener('click', (e) => {
     listPageSize = Number(btn.dataset.size);
     savePageSize('cuoti.listPageSize', listPageSize);
     listView.page = 1;
+    listPageBackCount = 0;
     selectedIds.clear();
     closeAllSizeMenus();
     loadList();
@@ -3503,8 +3525,9 @@ async function refreshReviewQueueFromDb() {
   if (!changed) return;
   const cur = currentItem();
   if (!cur || $('#review-box').classList.contains('hidden')) return;
-  if (cur.status === 'pending') renderQuestion();
-  else renderAnsweredState(cur);
+  // 统一走 renderQuestion：它会按新 q.answer/options 重算 currentAnswer，
+  // 不能只调 renderAnsweredState（导入覆盖后 currentAnswer 已被清空，会显示“答案空”）。
+  renderQuestion();
 }
 
 $('#import-btn').addEventListener('click', () => {
@@ -4935,6 +4958,14 @@ $('#ai-modal').addEventListener('click', (e) => {
 });
 
 // ============ 初始化 ============
+async function cleanupBlankQuestions() {
+  const all = await dbGetAll();
+  const bad = all.filter((q) => !isQuestionContentComplete(q));
+  if (!bad.length) return;
+  for (const q of bad) await dbDelete(q.id);
+  toast(`已清理 ${bad.length} 道空白题目`);
+}
+
 async function init() {
   // 尽量让浏览器把 IndexedDB 当持久数据，降低系统自动清理导致错题丢失的概率
   if (navigator.storage && typeof navigator.storage.persist === 'function') {
@@ -4942,6 +4973,7 @@ async function init() {
   }
   initAiUnlock();
   updateAutoNextUI();
+  await cleanupBlankQuestions();
   setType('single');
   switchTab('review');
   refreshBadge();
