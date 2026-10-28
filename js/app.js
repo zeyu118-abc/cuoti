@@ -1344,8 +1344,10 @@ $('#save-btn').addEventListener('click', async () => {
                 it.status = 'pending';
                 it.prevState = null; // 旧的作答统计已撤销，重新作答时按首次计数
                 it.prevSelected = null;
+                it.firstStatus = null;
               } else if (regraded) {
                 it.status = regraded; // 保留用户此前选择，用于显示纠正后的判定结果
+                it.firstStatus = regraded; // 今天第一次作答的结果随答案修正一起改，统计/答题卡同步
               }
             } else {
               reviewQueue.splice(i, 1);
@@ -1656,6 +1658,29 @@ function mergeImportedQuestion(local, incoming) {
 
 // 导入时用户选“覆盖”：备份里的内容和复习状态整体覆盖本机这道题，
 // 但保留本机 id/created_at 和题库来源（题库进度不能因覆盖丢掉）。
+// 导入覆盖后同步内存里的今日队列，避免“数据库已换、答题卡还是旧题/旧状态”
+function syncReviewItemAfterImport(q) {
+  if (!Array.isArray(reviewQueue) || reviewQueue.length === 0) return;
+  const today = fmtDate(new Date());
+  let changed = false;
+  reviewQueue.forEach((it) => {
+    if (!it || !it.q || it.q.id !== q.id) return;
+    it.q = q;
+    it.order = null;
+    it.selectedAnswer = [];
+    it.prevSelected = null;
+    it.prevState = null;
+    it.labels = null;
+    it.contents = null;
+    it.currentAnswer = null;
+    it.retry = false;
+    it.status = q.last_reviewed === today ? (q.last_result === 'correct' ? 'correct' : 'wrong') : 'pending';
+    it.firstStatus = it.status === 'pending' ? null : it.status;
+    changed = true;
+  });
+  if (changed) saveSession();
+}
+
 function overwriteImportedQuestion(local, incoming) {
   const localId = local.id;
   const localCreatedAt = local.created_at;
@@ -2385,8 +2410,8 @@ function renderAnsweredState(it) {
   refreshBottomBar(); // 更新「返回」按钮与「下一题/完成」按钮
   $('#review-note-btn').classList.remove('hidden');
   $('#review-edit-btn').classList.remove('hidden');
-  if (correct) $('#review-delete').classList.remove('hidden');
-  else $('#review-delete').classList.add('hidden');
+  // 这一版已按用户要求移除删除入口，答题正确时也不再显示“删除此题”
+  $('#review-delete').classList.add('hidden');
   renderReviewNote(it.q);
   updateAiVisibility();
 }
@@ -3343,7 +3368,7 @@ function renderDetail(q) {
     <div class="mt-5 flex flex-wrap gap-2">
       ${q.bank_id == null ? `<button id="detail-subject" class="px-4 py-2 rounded-lg bg-primary-50 text-primary-600 font-medium hover:bg-primary-100 transition"><i class="fa fa-tag mr-1"></i>设置科目</button>` : ''}
       <button id="detail-edit" class="px-4 py-2 rounded-lg bg-primary-50 text-primary-600 font-medium hover:bg-primary-100 transition"><i class="fa fa-pencil-square-o mr-1"></i>修改题目</button>
-      <button id="detail-delete" class="px-4 py-2 rounded-lg bg-red-50 text-red-600 font-medium hover:bg-red-100 transition"><i class="fa fa-trash-o mr-1"></i>删除此题</button>
+      <button id="detail-delete" class="hidden px-4 py-2 rounded-lg bg-red-50 text-red-600 font-medium hover:bg-red-100 transition"><i class="fa fa-trash-o mr-1"></i>删除此题</button>
     </div>
   `;
 
@@ -3538,6 +3563,7 @@ $('#import-file').addEventListener('change', async () => {
                 exact.next_review = fmtDate(addDays(new Date(), 1));
               }
               await dbPut(exact);
+              syncReviewItemAfterImport(exact);
               updated++;
               continue;
             }

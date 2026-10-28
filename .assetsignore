@@ -7,3 +7,4 @@ backup-*.json
 .git/**
 .github
 .github/**
+.assetsignore
