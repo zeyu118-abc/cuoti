@@ -221,11 +221,13 @@ function saveSession() {
     date: reviewSessionDate || fmtDate(new Date()),
     atTrophy: sessionAtTrophy,
     trophyRedo: isTrophyRedo,
+    browsing: isBrowsing,
     index: reviewIndex,
     items: reviewQueue.map((it) => ({
       id: it.q.id,
       kind: it.kind,
       status: it.status,
+      firstStatus: it.firstStatus || null,
       seq: it.seq != null ? it.seq : null,
       order: it.order || null,
       selectedAnswer: it.selectedAnswer || [],
@@ -250,6 +252,7 @@ function restoreSession(saved, all) {
       q,
       kind: s.kind === 'redo' ? 'redo' : 'main',
       status: ['pending', 'correct', 'wrong'].includes(s.status) ? s.status : 'pending',
+      firstStatus: ['correct', 'wrong'].includes(s.firstStatus) ? s.firstStatus : null,
       retry: false,
       seq: typeof s.seq === 'number' ? s.seq : null,
       order: Array.isArray(s.order) ? s.order : null,
@@ -271,6 +274,7 @@ function restoreSession(saved, all) {
   reviewTotal = items.filter((x) => x.kind === 'main').length;
   const savedIndex = typeof saved.index === 'number' ? saved.index : 0;
   reviewIndex = Math.max(0, Math.min(savedIndex, reviewQueue.length - 1));
+  isBrowsing = saved.browsing === true && saved.atTrophy !== true;
   return true;
 }
 
@@ -381,7 +385,7 @@ function switchTab(name, reload = true) {
 }
 document.querySelectorAll('.tab-btn').forEach((b) => b.addEventListener('click', () => {
   // 有没保存的录入内容时先确认，避免手滑切页签把整道题清空
-  if (b.dataset.tab !== 'input' && isInputDirty() && !confirm('当前录入的内容还没保存，确定离开吗？')) return;
+  if (isInputDirty() && !confirm('当前录入/JSON 内容还没保存，确定离开吗？')) return;
   // 用户主动点顶部页签离开子视图（详情/JSON 录入）时，丢弃遗留的返回栈，避免手机返回键乱跳
   if (backHandlers.length > 0) {
     history.go(-backHandlers.length);
@@ -1209,6 +1213,13 @@ $('#save-btn').addEventListener('click', async () => {
     const o = state.options[i] || {};
     return { label: l, text: (o.text || '').trim(), image: o.image || '' };
   });
+  // 编辑 2/3 选项题时表单仍显示 A-D，末尾空选项不算“没填”；
+  // 但中间缺选项、或答案指向已删选项，仍然要拦住。
+  while (options.length > LABELS_JUDGE.length) {
+    const last = options[options.length - 1];
+    if (last.text || last.image) break;
+    options.pop();
+  }
   // 快照表单状态：后面的 await 期间用户可能切页或改表单，保存应以点击「保存」那一刻为准
   const form = {
     editingId: state.editingId,
@@ -1221,6 +1232,9 @@ $('#save-btn').addEventListener('click', async () => {
   if (!qText && !form.questionImage) return toast('请填写题干或上传图片', false);
   if (form.answer.length === 0) return toast('请选择正确答案', false);
   if (options.some((o) => !o.text && !o.image)) return toast('请填写所有选项内容或上传图片', false);
+  if (form.answer.some((l) => !options.some((o) => o.label === l))) {
+    return toast('正确答案对应的选项不存在，请重新选择', false);
+  }
   if (imageTasks > 0) return toast('图片还在处理，请稍候再保存', false);
   if (savingQuestion) return;
 
@@ -1383,6 +1397,7 @@ $('#save-btn').addEventListener('click', async () => {
         }
         switchTab('review', false);
         renderQuestion();
+        updateReviewStats();
       }
     } else {
       const newQuestion = {
@@ -1408,6 +1423,8 @@ $('#save-btn').addEventListener('click', async () => {
         if (choice === 'skip') return toast('已取消保存', false);
         if (choice === 'retry') {
           await dbPut(resetDuplicateForTomorrow(similar));
+          removeQuestionFromQueue(similar.id);
+          saveSession();
           toast('已把重复题安排到明天重新复习，并记一次错');
           resetInput();
           loadList();
@@ -1454,7 +1471,10 @@ function markInputClean() {
   try { inputSnapshot = inputStateSignature(); } catch (e) { inputSnapshot = ''; }
 }
 function isInputDirty() {
-  try { return inputStateSignature() !== inputSnapshot || hasUnsavedReviewNote(); } catch (e) { return false; }
+  try {
+    const jsonText = ($('#json-text') && $('#json-text').value || '').trim();
+    return inputStateSignature() !== inputSnapshot || hasUnsavedReviewNote() || !!jsonText;
+  } catch (e) { return false; }
 }
 
 function resetInput() {
@@ -1568,9 +1588,19 @@ function findSimilar(q, all) {
 // 直接合并复习状态；只有“像但不是同一题”才走相似题确认。
 function isSameQuestionContent(a, b) {
   if (!a || !b) return false;
-  if ((a.type === 'judge') !== (b.type === 'judge')) return false;
+  // 题型、答案必须一致；答案被修订/单选改多选不能算“一模一样”。
+  if ((a.type || 'single') !== (b.type || 'single')) return false;
+  if (!sameSet(Array.isArray(a.answer) ? a.answer : [], Array.isArray(b.answer) ? b.answer : [])) return false;
+  const opts = (q) => (Array.isArray(q.options) ? q.options : []).map((o) => {
+    const text = normalizeText(typeof o === 'string' ? o : (o && o.text));
+    return text || ('img:' + String(o && o.image || ''));
+  }).filter(Boolean).sort();
+  const aa = opts(a), bb = opts(b);
+  if (aa.length !== bb.length) return false;
+  for (let i = 0; i < aa.length; i++) if (aa[i] !== bb[i]) return false;
   const na = normalizeText(a.question_text), nb = normalizeText(b.question_text);
   if (!na || !nb) {
+    // 纯图片题：只有题干图相同且选项/答案都相同，才算同一题。
     return !!(a.question_image && b.question_image && a.question_image === b.question_image);
   }
   if (na !== nb) return false;
@@ -1582,24 +1612,7 @@ function isSameQuestionContent(a, b) {
   for (let i = 0; i < Math.max(ia.length, ib.length); i++) {
     if (ia[i] && ib[i] && ia[i] !== ib[i]) return false;
   }
-  const opts = (q) => (Array.isArray(q.options) ? q.options : []).map((o) => {
-    const text = normalizeText(typeof o === 'string' ? o : (o && o.text));
-    return text || ('img:' + String(o && o.image || ''));
-  }).filter(Boolean).sort();
-  const aa = opts(a), bb = opts(b);
-  if (aa.length !== bb.length) return false;
-  for (let i = 0; i < aa.length; i++) if (aa[i] !== bb[i]) return false;
   return true;
-}
-
-// 导入备份时判断“是不是同一道题”：题干文字完全相同就算同一题，
-// 选项顺序/标签/文字有改动也按同一题合并复习状态，避免备份同步产生重复题。
-function isSameQuestionIdentity(a, b) {
-  if (!a || !b) return false;
-  if ((a.type === 'judge') !== (b.type === 'judge')) return false;
-  const na = normalizeText(a.question_text), nb = normalizeText(b.question_text);
-  if (na && nb) return na === nb;
-  return !!(a.question_image && b.question_image && a.question_image === b.question_image);
 }
 
 function mergeImportedQuestion(local, incoming) {
@@ -1641,6 +1654,43 @@ function mergeImportedQuestion(local, incoming) {
   local.notes = notes;
 }
 
+// 导入时用户选“覆盖”：备份里的内容和复习状态整体覆盖本机这道题，
+// 但保留本机 id/created_at 和题库来源（题库进度不能因覆盖丢掉）。
+function overwriteImportedQuestion(local, incoming) {
+  const localId = local.id;
+  const localCreatedAt = local.created_at;
+  const localBankId = local.bank_id;
+  Object.assign(local, {
+    type: incoming.type,
+    question_text: incoming.question_text,
+    question_image: incoming.question_image,
+    options: Array.isArray(incoming.options) ? incoming.options : [],
+    answer: Array.isArray(incoming.answer) ? incoming.answer : [],
+    subject: incoming.subject || local.subject,
+    note: incoming.note || local.note || '',
+    notes: (() => {
+      const out = Array.isArray(local.notes) ? local.notes.slice() : [];
+      const seen = new Set(out.map((n) => JSON.stringify(n)));
+      (Array.isArray(incoming.notes) ? incoming.notes : []).forEach((n) => {
+        const key = JSON.stringify(n);
+        if (!seen.has(key)) { seen.add(key); out.push(n); }
+      });
+      return out;
+    })(),
+    review_stage: Number(incoming.review_stage) || 0,
+    next_review: incoming.next_review || '',
+    correct_count: Number(incoming.correct_count) || 0,
+    wrong_count: Number(incoming.wrong_count) || 0,
+    last_reviewed: incoming.last_reviewed || '',
+    last_result: incoming.last_result || '',
+    created_at: localCreatedAt,
+    id: localId,
+  });
+  if (localBankId != null) local.bank_id = localBankId;
+  else if (incoming.bank_id != null) local.bank_id = incoming.bank_id;
+  return local;
+}
+
 function renderCompareBox(el, q, title) {
   const typeText = q.type === 'single' ? '单选' : q.type === 'multiple' ? '多选' : '判断';
   const opts = (q.options || []).map((o) => `${escapeHtml(o.label || '?')}. ${escapeHtml(o.text || '（图片）')}`).join('<br>');
@@ -1654,32 +1704,38 @@ function renderCompareBox(el, q, title) {
 }
 
 let dupResolve = null;
+let dupForceChoice = 'keep';
 
-// 重复题第三选择：把已录入的那道题当成“今天又做错一次”，
-// 轮次归零、明天重新开始，并清掉原下次复习日期。
+// 重复题第三选择：把已录入的那道题当成“又做错一次”，
+// 轮次归零、明天重新开始；这不是今天真正作答，不能写 last_reviewed/last_result，
+// 否则会被“今日已复习/今日正确率”当成今天做过。
 function resetDuplicateForTomorrow(q) {
   q.review_stage = 0;
   q.next_review = fmtDate(addDays(new Date(), 1));
   q.wrong_count = (Number(q.wrong_count) || 0) + 1;
-  q.last_reviewed = fmtDate(new Date());
-  q.last_result = 'wrong';
+  q.last_reviewed = '';
+  q.last_result = '';
   return q;
 }
 
-function askDuplicate(newQ, oldQ, action) {
+function askDuplicate(newQ, oldQ, action, exact = false) {
   return new Promise((resolve) => {
     renderCompareBox($('#dup-new'), newQ, action === '导入' ? '你正在导入的题目' : '你正在录入的题目');
     renderCompareBox($('#dup-old'), oldQ, '已录入的题目');
-    $('#dup-keep').textContent = '不是同一题，仍要' + action;
+    $('#dup-title').innerHTML = exact
+      ? '<i class="fa fa-exclamation-triangle text-amber-500 mr-1"></i>发现一模一样的题目'
+      : '<i class="fa fa-exclamation-triangle text-amber-500 mr-1"></i>发现相似题目，请确认';
+    $('#dup-keep').textContent = exact ? '覆盖：用备份里的题目和复习状态覆盖本机' : '不是同一题，仍要' + action;
     $('#dup-retry').classList.remove('hidden');
-    $('#dup-skip').textContent = action === '导入' ? '是同一题，跳过不导入' : '是同一题，取消保存';
+    $('#dup-skip').textContent = exact ? '跳过：保留本机这道题不变' : (action === '导入' ? '是同一题，跳过不导入' : '是同一题，取消保存');
+    dupForceChoice = exact ? 'overwrite' : 'keep';
     dupResolve = resolve;
     $('#dup-modal').classList.remove('hidden');
   });
 }
 $('#dup-keep').addEventListener('click', () => {
   $('#dup-modal').classList.add('hidden');
-  if (dupResolve) { dupResolve('keep'); dupResolve = null; }
+  if (dupResolve) { const choice = dupForceChoice; dupResolve(choice); dupResolve = null; dupForceChoice = 'keep'; }
 });
 $('#dup-retry').addEventListener('click', () => {
   $('#dup-modal').classList.add('hidden');
@@ -1736,6 +1792,7 @@ async function loadReview() {
   // 优先恢复今天已保存的会话；没有或跨天则全新开始（每日顺序确定）
   const saved = getSavedSession();
   const resumedTrophyRedo = !!(saved && saved.date === today && saved.trophyRedo === true);
+  const resumedBrowsing = !!(saved && saved.date === today && saved.browsing === true && saved.atTrophy !== true);
   let resumedAtTrophy = false;
   if (!(saved && saved.date === today && restoreSession(saved, all))) {
     buildFreshSession(all, today);
@@ -1766,15 +1823,15 @@ async function loadReview() {
   refreshBadge();
 
   if (reviewQueue.length > 0) {
-    if (totalPending === 0) {
+    if (totalPending === 0 && !resumedBrowsing) {
       showReviewComplete();
     } else {
-      isBrowsing = false; // 正常复习（还有待做题）
+      isBrowsing = resumedBrowsing; // 回看中刷新/切页签，回到原来那一题
       if (reviewIndex >= reviewQueue.length) reviewIndex = 0;
       // 刷新时如果停在已答过的题上，恢复原来的“重做”入口；
-      // 重做不再累计统计，所以不会因为刷新多算一次。
+      // 重做不再累计统计，所以不会因为刷新多算一次。回看态保持只读，不自动进重做。
       const cur = currentItem();
-      if (cur && cur.status !== 'pending') enterRedo(reviewIndex);
+      if (!isBrowsing && cur && cur.status !== 'pending') enterRedo(reviewIndex);
       else renderQuestion();
     }
   } else {
@@ -1840,7 +1897,7 @@ function nextButtonLabel() {
 function refreshBottomBar() {
   const hasPendingNow = reviewQueue.some((x) => x.status === 'pending');
   // 完成页「回看今日错题」是重做模式：即使还有待做也保留返回，随时回完成页
-  $('#review-back').classList.toggle('hidden', hasPendingNow && !isTrophyRedo);
+  $('#review-back').classList.toggle('hidden', hasPendingNow && !isTrophyRedo && !isBrowsing);
   $('#next-question').classList.toggle('hidden', !shouldShowNext());
   const label = $('#next-question .side-label');
   if (label) label.textContent = nextButtonLabel();
@@ -2167,6 +2224,7 @@ function openTrophyRedo(ids, all) {
 
 async function showReviewComplete() {
   clearReviewAutoTimer();
+  isBrowsing = false;
   isTrophyRedo = false;
   let all;
   try {
@@ -2193,7 +2251,7 @@ async function showReviewComplete() {
   const savedSession = getSavedSession();
   if (savedSession && savedSession.date === today && Array.isArray(savedSession.items)) {
     savedSession.items.forEach((s) => {
-      if (s && s.kind === 'main' && s.status === 'wrong' && all.some((q) => q.id === s.id)) {
+      if (s && s.kind === 'main' && (s.firstStatus || s.status) === 'wrong' && all.some((q) => q.id === s.id)) {
         wrongIdSet.add(s.id);
       }
     });
@@ -2274,6 +2332,7 @@ async function showReviewComplete() {
     if (mainItems.length === 0) return toast('今天还没有做题记录', false);
     isBrowsing = true;
     isTrophyRedo = false;
+    sessionAtTrophy = false;
     reviewQueue.length = 0;
     mainItems.forEach((it) => reviewQueue.push(it));
     reviewTotal = mainItems.length;
@@ -2282,6 +2341,7 @@ async function showReviewComplete() {
     $('#review-box').classList.remove('hidden');
     renderQuestion();
     pushBack(exitBrowse); // 回看时手机返回键/返回按钮都退回完成页
+    saveSession(); // 记住“回看中”与当前位置，刷新/切页签不丢
   });
 
   const wrongBtn = $('#review-wrong-btn');
@@ -2388,14 +2448,22 @@ async function submitCurrentAnswer() {
     it.prevSelected = null;
   }
 
+  // 主复习项单独记住“今天第一次”的结果，答题卡颜色/今日错题只看它；
+  // 手动重做无论在答题卡点绿卡还是红卡，都不改写这个首次结果。
+  if (!it.firstStatus) {
+    it.firstStatus = it.kind === 'main'
+      ? (isFirstAttempt ? (correct ? 'correct' : 'wrong') : it.status)
+      : null;
+  }
   it.status = correct ? 'correct' : 'wrong';
   it.retry = false;
 
-  // 做错：队尾追加一次重做；手动重做答错时，若已有待重做项就不重复加
+  // 做错：队尾追加一次重做；手动重做答错时，若已有待重做项就不重复加。
+  // 首次已经做对的题被手动重做做错，不算“今天做错”，不追加错题重做。
   const hasPendingRedoForQ = reviewQueue.some(
     (x) => x.kind === 'redo' && x.q.id === it.q.id && x.status === 'pending'
   );
-  if (!correct && !hasPendingRedoForQ) {
+  if (!correct && it.firstStatus !== 'correct' && !hasPendingRedoForQ) {
     reviewQueue.push({ q: it.q, status: 'pending', kind: 'redo', retry: false, selectedAnswer: [], prevSelected: null });
   }
 
@@ -2493,6 +2561,12 @@ $('#prev-question').addEventListener('click', () => {
 // ============ 答题卡 ============
 function enterRedo(index) {
   const it = reviewQueue[index];
+  // 回看是只读浏览，点已答卡只跳过去看结果，不能再进入重做/追加错题。
+  if (isBrowsing) {
+    reviewIndex = index;
+    renderQuestion();
+    return;
+  }
   // 保留上次判分时的选择，之后若改答案，重判才能按“当时真实选了什么”来算
   if (!Array.isArray(it.prevSelected) || it.prevSelected.length === 0) {
     it.prevSelected = Array.isArray(it.selectedAnswer) ? it.selectedAnswer.slice() : [];
@@ -2538,8 +2612,10 @@ function renderAnswerSheet() {
       const btn = document.createElement('button');
       btn.type = 'button';
       btn.textContent = (it.seq != null ? it.seq : 0) + 1;
-      if (it.status === 'correct') btn.className = 'h-11 rounded-lg font-semibold text-sm bg-green-500 text-white';
-      else if (it.status === 'wrong') btn.className = 'h-11 rounded-lg font-semibold text-sm bg-red-500 text-white';
+      // 主项颜色只看今天第一次结果；手动重做做错不会把绿卡变红。
+      const shownStatus = it.firstStatus || it.status;
+      if (shownStatus === 'correct') btn.className = 'h-11 rounded-lg font-semibold text-sm bg-green-500 text-white';
+      else if (shownStatus === 'wrong') btn.className = 'h-11 rounded-lg font-semibold text-sm bg-red-500 text-white';
       else btn.className = 'h-11 rounded-lg font-semibold text-sm bg-slate-200 text-slate-500';
       // 灰色未做也可点进（视为今天第一次做）；绿/红点击则进入手动重做
       btn.addEventListener('click', () => {
@@ -2901,6 +2977,7 @@ function renderTypeTabs(container, currentType) {
     btn.addEventListener('click', () => {
       listView.typeFilter = t.key;
       listView.page = 1;
+      selectedIds.clear(); // 筛选后不可见的勾选不能带到下一次批量删除
       loadList();
       window.scrollTo(0, 0);
     });
@@ -3078,6 +3155,7 @@ let listSearchTimer = null;
 $('#list-search').addEventListener('input', (e) => {
   listKeyword = e.target.value.trim();
   listView.page = 1;
+  selectedIds.clear();
   clearTimeout(listSearchTimer);
   listSearchTimer = setTimeout(() => {
     listSearchTimer = null;
@@ -3090,6 +3168,7 @@ $('#list-search-clear').addEventListener('click', () => {
   listKeyword = '';
   $('#list-search').value = '';
   listView.page = 1;
+  selectedIds.clear();
   loadList();
 });
 $('#batch-cancel').addEventListener('click', () => {
@@ -3099,7 +3178,10 @@ $('#batch-cancel').addEventListener('click', () => {
 });
 $('#batch-delete').addEventListener('click', async () => {
   if (selectedIds.size === 0) return toast('请先选择要删除的题目', false);
-  const ids = [...selectedIds];
+  // 只删除当前筛选结果里还看得见的题；筛选/搜索变化后残留的隐藏 id 不参与删除。
+  const visibleIds = new Set(currentFullList.map((q) => q.id));
+  const ids = [...selectedIds].filter((id) => visibleIds.has(id));
+  if (ids.length === 0) return toast('当前列表里没有选中的题，请重新选择', false);
   if (!confirm(`确定删除选中的 ${ids.length} 道题吗？`)) return;
   // 单题失败不影响其它题，最后统一刷新界面
   let ok = 0, fail = 0;
@@ -3191,6 +3273,7 @@ document.addEventListener('click', (e) => {
     listPageSize = Number(btn.dataset.size);
     savePageSize('cuoti.listPageSize', listPageSize);
     listView.page = 1;
+    selectedIds.clear();
     closeAllSizeMenus();
     loadList();
     window.scrollTo(0, 0);
@@ -3381,6 +3464,24 @@ $('#export-btn').addEventListener('click', async () => {
   }
 });
 
+// 导入/覆盖之后，复习页内存里的 q 还是旧快照；只刷新“同类对象”，
+// 不重建整个会话，避免打断当前题和已选答案。
+async function refreshReviewQueueFromDb() {
+  if (!reviewQueue.length) return;
+  const all = await dbGetAll();
+  const byId = new Map(all.map((q) => [q.id, q]));
+  let changed = false;
+  reviewQueue.forEach((it) => {
+    const fresh = byId.get(it.q.id);
+    if (fresh && fresh !== it.q) { it.q = fresh; changed = true; }
+  });
+  if (!changed) return;
+  const cur = currentItem();
+  if (!cur || $('#review-box').classList.contains('hidden')) return;
+  if (cur.status === 'pending') renderQuestion();
+  else renderAnsweredState(cur);
+}
+
 $('#import-btn').addEventListener('click', () => {
   setBackupMenuOpen(false);
   $('#import-file').click();
@@ -3418,13 +3519,28 @@ $('#import-file').addEventListener('change', async () => {
           const q = sanitizeBackupQuestion(rest);
           // 导入的图片也做「白底 + 去黑边」处理，和 JSON 录入一致
           await processQuestionImages(q);
-          // 备份同步：题干相同的题，不弹“相似题”，直接把复习状态合并到本机。
-          // 这里先合并再判断“今日到期顺延”，保证同一道题导入时用的是备份里的复习时间。
-          const same = existing.find((item) => isSameQuestionContent(q, item) || isSameQuestionIdentity(q, item));
-          if (same) {
-            mergeImportedQuestion(same, q);
-            await dbPut(same);
-            updated++;
+          // 一模一样（题干和选项都相同）时让用户选择：跳过 / 覆盖 / 从明天重新复习。
+          // 不再自动合并，避免用户以为导入会新增或同步，结果被静默改掉。
+          const exact = existing.find((item) => isSameQuestionContent(q, item));
+          if (exact) {
+            const choice = await askDuplicate(q, exact, '导入', true);
+            if (choice === 'skip') { skipped++; continue; }
+            if (choice === 'retry') {
+              await dbPut(resetDuplicateForTomorrow(exact));
+              removeQuestionFromQueue(exact.id);
+              saveSession();
+              updated++;
+              continue;
+            }
+            if (choice === 'overwrite') {
+              overwriteImportedQuestion(exact, q);
+              if (exact.next_review && exact.next_review <= today && sessionToday) {
+                exact.next_review = fmtDate(addDays(new Date(), 1));
+              }
+              await dbPut(exact);
+              updated++;
+              continue;
+            }
             continue;
           }
           // 今日复习会话已开始时，新导入的到期题推迟到明天，避免打乱今日队列与答题卡
@@ -3437,11 +3553,13 @@ $('#import-file').addEventListener('change', async () => {
             if (choice === 'skip') { skipped++; continue; }
             if (choice === 'retry') {
               await dbPut(resetDuplicateForTomorrow(similar));
+              removeQuestionFromQueue(similar.id);
+              saveSession();
               updated++;
               continue;
             }
           }
-          await dbAdd(q);
+          q.id = await dbAdd(q);
           existing.push(q);
           total++;
         } catch (e) {
@@ -3462,6 +3580,7 @@ $('#import-file').addEventListener('change', async () => {
     }
     loadList();
     refreshBadge();
+    await refreshReviewQueueFromDb();
   } catch (e) {
     toast('导入失败：' + e.message, false);
   } finally {
@@ -3483,8 +3602,9 @@ $('#to-json-input').addEventListener('click', () => {
 });
 $('#to-paste-input').addEventListener('click', () => {
   if (backHandlers.length > 0) {
-    history.back();
+    history.back(); // 走 popstate 的未保存确认
   } else {
+    if ($('#json-text').value.trim() && !confirm('JSON 内容还没导入，确定返回吗？')) return;
     $('#input-json').classList.add('hidden');
     $('#input-paste').classList.remove('hidden');
     $('#json-text').value = '';
@@ -3587,11 +3707,13 @@ async function importJsonArray(arr) {
           if (choice === 'skip') { skipped++; continue; }
           if (choice === 'retry') {
             await dbPut(resetDuplicateForTomorrow(similar));
+            removeQuestionFromQueue(similar.id);
+            saveSession();
             retried++;
             continue;
           }
         }
-        await dbAdd(q);
+        q.id = await dbAdd(q);
         existing.push(q);
         ok++;
       } catch (e) {
@@ -3603,6 +3725,7 @@ async function importJsonArray(arr) {
       toast('成功录入 ' + ok + ' 题' + (retried > 0 ? '，重新安排 ' + retried + ' 题' : '') + (skipped > 0 ? '，跳过重复 ' + skipped + ' 题' : '') + (fail > 0 ? '，失败 ' + fail + ' 题' : ''));
       loadList();
       refreshBadge();
+      await refreshReviewQueueFromDb();
     } else if (skipped > 0) {
       toast('全部为重复题目，已跳过', false);
     } else {

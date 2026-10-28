@@ -52,7 +52,7 @@ export default {
       return handleAI(request, env);
     }
     // 未知 /api 路径不要被 Pages 的 SPA 回退成首页 HTML
-    if (url.pathname.startsWith('/api/')) {
+    if (url.pathname === '/api' || url.pathname.startsWith('/api/')) {
       return json({ error: '接口不存在' }, 404);
     }
 
@@ -82,19 +82,27 @@ async function handleAI(request, env) {
     });
   }
 
+  if (!env.AI_TOKEN) {
+    return json({ error: '服务端未配置 AI_TOKEN', code: 'no_token' }, 503);
+  }
+
   const auth = request.headers.get('Authorization') || '';
-  const authorized = !!env.AI_TOKEN && auth === 'Bearer ' + env.AI_TOKEN;
+  const authorized = auth === 'Bearer ' + env.AI_TOKEN;
 
   // GET 只用于验证口令，不调用 DeepSeek，不产生费用。
   // 前端只有验证通过后才显示 AI 按钮，别的设备猜错口令也不会出现按钮。
   if (request.method === 'GET') {
-    return authorized ? json({ ok: true }, 200) : json({ error: '未授权' }, 401);
+    if (!authorized) return json({ error: '未授权' }, 401);
+    if (!env.DEEPSEEK_API_KEY) {
+      return json({ error: '服务端未配置 API Key', code: 'no_api_key' }, 503);
+    }
+    return json({ ok: true }, 200);
   }
   if (request.method !== 'POST') return json({ error: '只支持 POST' }, 405);
   if (!authorized) return json({ error: '未授权' }, 401);
 
   if (!env.DEEPSEEK_API_KEY) {
-    return json({ error: '服务端未配置 API Key' }, 500);
+    return json({ error: '服务端未配置 API Key', code: 'no_api_key' }, 503);
   }
 
   let body;
