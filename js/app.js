@@ -3027,6 +3027,7 @@ async function loadList() {
   $('#list-empty').classList.toggle('hidden', pageList.length > 0 || !emptyText);
 
   $('#batch-bar').classList.toggle('hidden', !listSelectMode);
+  $('#batch-btn').classList.toggle('hidden', fullList.length === 0);
   $('#batch-btn').innerHTML = listSelectMode
     ? '<i class="fa fa-times mr-1"></i>退出删除'
     : '<i class="fa fa-trash-o mr-1"></i>删除题目';
