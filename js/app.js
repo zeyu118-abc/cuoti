@@ -1656,27 +1656,14 @@ function isSameQuestionContent(a, b) {
 }
 
 function mergeImportedQuestion(local, incoming) {
-  const localLast = local.last_reviewed || '';
-  const incomingLast = incoming.last_reviewed || '';
-  const localStage = Number(local.review_stage) || 0;
-  const incomingStage = Number(incoming.review_stage) || 0;
-  // 以“最后一次复习时间”判断哪边更新；日期相同再看轮次，避免把平板上的旧状态覆盖手机上的新状态。
-  // 本机这道题还没开始复习（没有 last_reviewed/上次结果）时，备份里的进度就是唯一进度，
-  // 即使两边 last_reviewed 都为空，也要把备份的下次复习日期带过来。
-  const localUntouched = !localLast && localStage === 0 && !local.last_result;
-  const incomingNewer = incomingLast > localLast
-    || (incomingLast === localLast && incomingStage > localStage)
-    || (localUntouched && (incomingLast || incomingStage > 0 || incoming.next_review));
-  if (incomingNewer) {
-    local.review_stage = incomingStage;
-    local.next_review = incoming.next_review || '';
-    local.last_reviewed = incomingLast;
-    local.last_result = incoming.last_result || '';
-    // “每个题采用最新一次做题记录”：整组进度字段跟最新一方走，
-    // 不能只取 max(对错次数)，否则会把本机旧的高次数拼到备份的新记录上。
-    local.correct_count = Number(incoming.correct_count) || 0;
-    local.wrong_count = Number(incoming.wrong_count) || 0;
-  }
+  // 用户确认：导入备份按“恢复模式”——复习时间/轮次/对错次数全部以备份文件为准，
+  // 不跟本机比较谁更新。本机只保留题目内容、id、created_at 等身份字段。
+  local.review_stage = Number(incoming.review_stage) || 0;
+  local.next_review = incoming.next_review || '';
+  local.last_reviewed = incoming.last_reviewed || '';
+  local.last_result = incoming.last_result || '';
+  local.correct_count = Number(incoming.correct_count) || 0;
+  local.wrong_count = Number(incoming.wrong_count) || 0;
   // 同一道题在平板上可能是手动录入、在手机上是题库题；合并时保留题库来源，
   // 否则行测入口会少算一道，列表“全部”也会对不上。
   if (local.bank_id == null && incoming.bank_id != null) local.bank_id = incoming.bank_id;
@@ -1829,8 +1816,8 @@ function askDuplicate(newQ, oldQ, mode = 'create', exact = false) {
       : (isSync ? '不是同一题，仍要导入' : '不是同一题，另存为新题');
     // 相似题才显示“保留新录入版本”：替换旧题内容，但保留旧复习进度。
     $('#dup-replace').classList.toggle('hidden', isSync || exact);
-    // “从明天重新复习”只属于录入；导入备份不能借这个按钮改统计。
-    $('#dup-retry').classList.toggle('hidden', isSync);
+    // “从明天重新复习”只给“完全相同”的录入题；相似题不再出现，避免和“保留新版/旧版”混在一起。
+    $('#dup-retry').classList.toggle('hidden', isSync || !exact);
     $('#dup-skip').textContent = exact
       ? '跳过：保留本机这道题不变'
       : (isSync ? '是同一题，跳过不导入' : '保留旧版本（跳过）');
