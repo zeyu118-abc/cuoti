@@ -1435,14 +1435,16 @@ $('#save-btn').addEventListener('click', async () => {
         review_stage: 0,
         next_review: fmtDate(addDays(new Date(), INTERVALS[0])),
         correct_count: 0,
-        wrong_count: 1,
+        // 与 normalizeQuestion 一致：新录入题第一次复习答错才记 1 次
+        wrong_count: 0,
         last_reviewed: '',
         last_result: '',
         created_at: new Date().toISOString(),
       };
       const similar = findSimilar(newQuestion, await dbGetAll());
       if (similar) {
-        const choice = await askDuplicate(newQuestion, similar, '保存');
+        const exact = isSameQuestionContent(newQuestion, similar);
+        const choice = await askDuplicate(newQuestion, similar, 'create', exact);
         if (choice === 'skip') return toast('已取消保存', false);
         if (choice === 'retry') {
           await dbPut(resetDuplicateForTomorrow(similar));
@@ -1649,13 +1651,21 @@ function mergeImportedQuestion(local, incoming) {
   const localStage = Number(local.review_stage) || 0;
   const incomingStage = Number(incoming.review_stage) || 0;
   // 以“最后一次复习时间”判断哪边更新；日期相同再看轮次，避免把平板上的旧状态覆盖手机上的新状态。
+  // 本机这道题还没开始复习（没有 last_reviewed/上次结果）时，备份里的进度就是唯一进度，
+  // 即使两边 last_reviewed 都为空，也要把备份的下次复习日期带过来。
+  const localUntouched = !localLast && localStage === 0 && !local.last_result;
   const incomingNewer = incomingLast > localLast
-    || (incomingLast === localLast && incomingStage > localStage);
+    || (incomingLast === localLast && incomingStage > localStage)
+    || (localUntouched && (incomingLast || incomingStage > 0 || incoming.next_review));
   if (incomingNewer) {
     local.review_stage = incomingStage;
     local.next_review = incoming.next_review || '';
     local.last_reviewed = incomingLast;
     local.last_result = incoming.last_result || '';
+    // “每个题采用最新一次做题记录”：整组进度字段跟最新一方走，
+    // 不能只取 max(对错次数)，否则会把本机旧的高次数拼到备份的新记录上。
+    local.correct_count = Number(incoming.correct_count) || 0;
+    local.wrong_count = Number(incoming.wrong_count) || 0;
   }
   // 同一道题在平板上可能是手动录入、在手机上是题库题；合并时保留题库来源，
   // 否则行测入口会少算一道，列表“全部”也会对不上。
@@ -1669,8 +1679,6 @@ function mergeImportedQuestion(local, incoming) {
       return o;
     });
   }
-  local.correct_count = Math.max(Number(local.correct_count) || 0, Number(incoming.correct_count) || 0);
-  local.wrong_count = Math.max(Number(local.wrong_count) || 0, Number(incoming.wrong_count) || 0);
   if (!local.subject && incoming.subject) local.subject = incoming.subject;
   if (!local.note && incoming.note) local.note = incoming.note;
   const notes = Array.isArray(local.notes) ? local.notes.slice() : [];
@@ -1773,16 +1781,27 @@ function removeDuplicateFromTodayQueue(q) {
   removeQuestionFromQueue(q.id);
 }
 
-function askDuplicate(newQ, oldQ, action, exact = false) {
+// mode='create'：录入（表单 / JSON 批量录入）→ 新题；完全相同不允许“仍要保存”
+// mode='sync'：导入备份 → 同一题同步；完全相同已在调用方自动合并，不会到这里
+function askDuplicate(newQ, oldQ, mode = 'create', exact = false) {
   return new Promise((resolve) => {
-    renderCompareBox($('#dup-new'), newQ, action === '导入' ? '你正在导入的题目' : '你正在录入的题目');
+    const isSync = mode === 'sync';
+    renderCompareBox($('#dup-new'), newQ, isSync ? '你正在导入的题目' : '你正在录入的题目');
     renderCompareBox($('#dup-old'), oldQ, '已录入的题目');
     $('#dup-title').innerHTML = exact
       ? '<i class="fa fa-exclamation-triangle text-amber-500 mr-1"></i>发现一模一样的题目'
       : '<i class="fa fa-exclamation-triangle text-amber-500 mr-1"></i>发现相似题目，请确认';
-    $('#dup-keep').textContent = exact ? '覆盖：用备份里的题目和复习状态覆盖本机' : '不是同一题，仍要' + action;
-    $('#dup-retry').classList.remove('hidden');
-    $('#dup-skip').textContent = exact ? '跳过：保留本机这道题不变' : (action === '导入' ? '是同一题，跳过不导入' : '是同一题，取消保存');
+    // 录入遇到一模一样：只允许跳过或“从明天重新复习”，不给“仍要保存”制造重复题。
+    // 备份同步遇到一模一样不会走到这里（调用方已自动合并）。
+    $('#dup-keep').classList.toggle('hidden', exact && !isSync);
+    $('#dup-keep').textContent = exact
+      ? '覆盖：用备份里的题目和复习状态覆盖本机'
+      : (isSync ? '不是同一题，仍要导入' : '不是同一题，仍要保存');
+    // “从明天重新复习”只属于录入；导入备份不能借这个按钮改统计。
+    $('#dup-retry').classList.toggle('hidden', isSync);
+    $('#dup-skip').textContent = exact
+      ? '跳过：保留本机这道题不变'
+      : (isSync ? '是同一题，跳过不导入' : '是同一题，取消保存');
     dupForceChoice = exact ? 'overwrite' : 'keep';
     dupResolve = resolve;
     $('#dup-modal').classList.remove('hidden');
@@ -3567,29 +3586,14 @@ $('#import-file').addEventListener('change', async () => {
           const q = sanitizeBackupQuestion(rest);
           // 导入的图片也做「白底 + 去黑边」处理，和 JSON 录入一致
           await processQuestionImages(q);
-          // 一模一样（题干和选项都相同）时让用户选择：跳过 / 覆盖 / 从明天重新复习。
-          // 不再自动合并，避免用户以为导入会新增或同步，结果被静默改掉。
+          // 备份导入时，题干和选项完全一样就是同一道题：直接合并复习状态
+          // （不会一道一道问），把手机上的做题时间/轮次带过来。
           const exact = existing.find((item) => isSameQuestionContent(q, item));
           if (exact) {
-            const choice = await askDuplicate(q, exact, '导入', true);
-            if (choice === 'skip') { skipped++; continue; }
-            if (choice === 'retry') {
-              await dbPut(resetDuplicateForTomorrow(exact));
-              removeQuestionFromQueue(exact.id);
-              saveSession();
-              updated++;
-              continue;
-            }
-            if (choice === 'overwrite') {
-              overwriteImportedQuestion(exact, q);
-              if (exact.next_review && exact.next_review <= today && sessionToday) {
-                exact.next_review = fmtDate(addDays(new Date(), 1));
-              }
-              await dbPut(exact);
-              syncReviewItemAfterImport(exact);
-              updated++;
-              continue;
-            }
+            mergeImportedQuestion(exact, q);
+            await dbPut(exact);
+            syncReviewItemAfterImport(exact);
+            updated++;
             continue;
           }
           // 今日复习会话已开始时，新导入的到期题推迟到明天，避免打乱今日队列与答题卡
@@ -3598,15 +3602,8 @@ $('#import-file').addEventListener('change', async () => {
           }
           const similar = findSimilar(q, existing);
           if (similar) {
-            const choice = await askDuplicate(q, similar, '导入');
+            const choice = await askDuplicate(q, similar, 'sync');
             if (choice === 'skip') { skipped++; continue; }
-            if (choice === 'retry') {
-              await dbPut(resetDuplicateForTomorrow(similar));
-              removeQuestionFromQueue(similar.id);
-              saveSession();
-              updated++;
-              continue;
-            }
           }
           q.id = await dbAdd(q);
           existing.push(q);
@@ -3752,7 +3749,9 @@ async function importJsonArray(arr) {
         await processQuestionImages(q);
         const similar = findSimilar(q, existing);
         if (similar) {
-          const choice = await askDuplicate(q, similar, '导入');
+          // JSON 批量录入也是“新录入”：即使来源是别人的备份题，进度也重置为全新题。
+          const exact = isSameQuestionContent(q, similar);
+          const choice = await askDuplicate(q, similar, 'create', exact);
           if (choice === 'skip') { skipped++; continue; }
           if (choice === 'retry') {
             await dbPut(resetDuplicateForTomorrow(similar));
@@ -3940,7 +3939,9 @@ function normalizeQuestion(raw, idx) {
     review_stage: 0,
     next_review: fmtDate(addDays(new Date(), INTERVALS[0])),
     correct_count: 0,
-    wrong_count: 1,
+    // 新录入/新导入的题还没在 App 里作答，答错次数从 0 开始；
+    // 第一次复习答错才记 1 次，避免“录入即 1 次 + 第一次答错又 1 次”。
+    wrong_count: 0,
     last_reviewed: '',
     last_result: '',
     created_at: new Date().toISOString(),
