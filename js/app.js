@@ -452,6 +452,13 @@ function pushListPageBack() {
 window.addEventListener('popstate', () => {
   const backFn = backHandlers.pop();
   if (!backFn) return;
+  // 导入期间禁止用返回键离开当前页，避免导入到一半切走
+  if (importBusy) {
+    backHandlers.push(backFn);
+    history.pushState({ back: backHandlers.length }, '');
+    toast('正在导入备份，请稍候', false);
+    return;
+  }
   // 手机返回键/浏览器后退也要走“未保存确认”，不能只保护页签点击
   if (isInputDirty() && !confirm('当前录入的内容还没保存，确定离开吗？')) {
     backHandlers.push(backFn);
@@ -462,7 +469,7 @@ window.addEventListener('popstate', () => {
 });
 // 刷新/关闭页面时也提示（浏览器只显示通用文案，不能自定义）
 window.addEventListener('beforeunload', (e) => {
-  if (!isInputDirty()) return;
+  if (!isInputDirty() && !importBusy) return;
   e.preventDefault();
   e.returnValue = '';
 });
@@ -3509,6 +3516,22 @@ $('#back-to-list').addEventListener('click', () => {
 
 // ============ 导出 / 导入备份 ============
 let importBusy = false; // 导入进行中，防止重复触发导致相似题弹窗互相覆盖
+let importProgressCount = 0;
+
+function showImportProgress() {
+  importProgressCount = 0;
+  const box = $('#import-progress');
+  if (!box) return;
+  $('#import-progress-text').textContent = '已处理 0 题';
+  box.classList.remove('hidden');
+}
+function updateImportProgress() {
+  const el = $('#import-progress-text');
+  if (el) el.textContent = `已处理 ${importProgressCount} 题，请稍候…`;
+}
+function hideImportProgress() {
+  $('#import-progress')?.classList.add('hidden');
+}
 
 function setBackupMenuOpen(open) {
   $('#backup-menu').classList.toggle('hidden', !open);
@@ -3599,6 +3622,7 @@ $('#import-file').addEventListener('change', async () => {
   if (!files.length) return;
   if (importBusy) return toast('正在导入，请稍候', false);
   importBusy = true;
+  showImportProgress();
 
   let total = 0, updated = 0, skipped = 0, failed = 0;
   try {
@@ -3616,6 +3640,8 @@ $('#import-file').addEventListener('change', async () => {
       if (!Array.isArray(arr)) { failed++; continue; }
 
       for (const raw of arr) {
+        importProgressCount++;
+        updateImportProgress();
         try {
           // 去掉旧 id，重新生成；对每条题单独校验，坏题跳过不中断整个导入
           const source = (raw && typeof raw === 'object' && !Array.isArray(raw)) ? raw : {};
@@ -3665,13 +3691,16 @@ $('#import-file').addEventListener('change', async () => {
     } else {
       toast(parts.join('，'), total > 0 || updated > 0);
     }
+    hideImportProgress();
     loadList();
     resetReviewSessionAfterImport();
     if (!$('#tab-review').classList.contains('hidden')) await loadReview();
     refreshBadge();
   } catch (e) {
+    hideImportProgress();
     toast('导入失败：' + e.message, false);
   } finally {
+    hideImportProgress();
     importBusy = false;
   }
 });
