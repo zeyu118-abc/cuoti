@@ -1814,13 +1814,16 @@ function askDuplicate(newQ, oldQ, mode = 'create', exact = false) {
     $('#dup-keep').textContent = exact
       ? '覆盖：用备份里的题目和复习状态覆盖本机'
       : (isSync ? '不是同一题，仍要导入' : '不是同一题，另存为新题');
-    // 相似题才显示“保留新录入版本”：替换旧题内容，但保留旧复习进度。
-    $('#dup-replace').classList.toggle('hidden', isSync || exact);
+    // 相似题都显示“覆盖/保留新版本”：录入沿用旧进度，导入备份则整组用备份进度。
+    $('#dup-replace').classList.toggle('hidden', exact);
+    $('#dup-replace').textContent = isSync
+      ? '覆盖本机：用备份的题目和复习进度'
+      : '保留新版（替换旧题，沿用旧复习进度）';
     // “从明天重新复习”只给“完全相同”的录入题；相似题不再出现，避免和“保留新版/旧版”混在一起。
     $('#dup-retry').classList.toggle('hidden', isSync || !exact);
     $('#dup-skip').textContent = exact
       ? '跳过：保留本机这道题不变'
-      : (isSync ? '是同一题，跳过不导入' : '保留旧版本（跳过）');
+      : (isSync ? '跳过：保留本机这道题' : '保留旧版本（跳过）');
     dupForceChoice = exact ? 'overwrite' : 'keep';
     dupResolve = resolve;
     $('#dup-modal').classList.remove('hidden');
@@ -3627,6 +3630,14 @@ $('#import-file').addEventListener('change', async () => {
           if (similar) {
             const choice = await askDuplicate(q, similar, 'sync');
             if (choice === 'skip') { skipped++; continue; }
+            if (choice === 'replace') {
+              replaceQuestionContentKeepingProgress(similar, q);
+              mergeImportedQuestion(similar, q);
+              await dbPut(similar);
+              syncReviewItemAfterImport(similar);
+              updated++;
+              continue;
+            }
           }
           q.id = await dbAdd(q);
           existing.push(q);
