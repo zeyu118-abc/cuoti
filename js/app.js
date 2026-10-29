@@ -1817,6 +1817,13 @@ function removeDuplicateFromTodayQueue(q) {
 function askDuplicate(newQ, oldQ, mode = 'create', exact = false) {
   return new Promise((resolve) => {
     const isSync = mode === 'sync';
+    // 导入进度遮罩盖在重复题弹窗上会让用户点不到按钮，形成死等；弹窗期间先收起，选完再恢复。
+    const wasImporting = importBusy && !$('#import-progress').classList.contains('hidden');
+    if (wasImporting) hideImportProgress();
+    const finish = (choice) => {
+      if (wasImporting) resumeImportProgress();
+      resolve(choice);
+    };
     renderCompareBox($('#dup-new'), newQ, isSync ? '你正在导入的题目' : '你正在录入的题目');
     renderCompareBox($('#dup-old'), oldQ, '已录入的题目');
     $('#dup-title').innerHTML = exact
@@ -1839,7 +1846,7 @@ function askDuplicate(newQ, oldQ, mode = 'create', exact = false) {
       ? '跳过：保留本机这道题不变'
       : (isSync ? '跳过：保留本机这道题' : '保留旧版本（跳过）');
     dupForceChoice = exact ? 'overwrite' : 'keep';
-    dupResolve = resolve;
+    dupResolve = finish;
     $('#dup-modal').classList.remove('hidden');
   });
 }
@@ -3571,6 +3578,12 @@ function updateImportProgress() {
 }
 function hideImportProgress() {
   $('#import-progress')?.classList.add('hidden');
+}
+function resumeImportProgress() {
+  const box = $('#import-progress');
+  if (!box) return;
+  box.classList.remove('hidden');
+  updateImportProgress();
 }
 
 function setBackupMenuOpen(open) {
