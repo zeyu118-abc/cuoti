@@ -1446,6 +1446,16 @@ $('#save-btn').addEventListener('click', async () => {
         const exact = isSameQuestionContent(newQuestion, similar);
         const choice = await askDuplicate(newQuestion, similar, 'create', exact);
         if (choice === 'skip') return toast('已取消保存', false);
+        if (choice === 'replace') {
+          replaceQuestionContentKeepingProgress(similar, newQuestion);
+          await dbPut(similar);
+          syncReviewItemAfterImport(similar);
+          toast('已保留新录入版本，复习进度沿用原题');
+          resetInput();
+          loadList();
+          refreshBadge();
+          return;
+        }
         if (choice === 'retry') {
           await dbPut(resetDuplicateForTomorrow(similar));
           removeQuestionFromQueue(similar.id);
@@ -1715,6 +1725,26 @@ function syncReviewItemAfterImport(q) {
   if (changed) saveSession();
 }
 
+// 录入“相似题”里选“保留新录入版本”：只替换题目内容，复习进度继续沿用旧题。
+// 适用于“原来那道题录错了/选项旧了，用新版本修正”，不重来一轮。
+function replaceQuestionContentKeepingProgress(existing, newQ) {
+  existing.type = newQ.type;
+  existing.question_text = newQ.question_text;
+  existing.question_image = newQ.question_image || '';
+  existing.options = Array.isArray(newQ.options) ? newQ.options.map((o) => ({ ...o })) : [];
+  existing.answer = Array.isArray(newQ.answer) ? newQ.answer.slice() : [];
+  if (newQ.subject) existing.subject = newQ.subject;
+  if (newQ.note) existing.note = newQ.note;
+  const notes = Array.isArray(existing.notes) ? existing.notes.slice() : [];
+  const seen = new Set(notes.map((n) => JSON.stringify(n)));
+  (Array.isArray(newQ.notes) ? newQ.notes : []).forEach((n) => {
+    const key = JSON.stringify(n);
+    if (!seen.has(key)) { seen.add(key); notes.push(n); }
+  });
+  existing.notes = notes;
+  // id / created_at / bank_id / review_stage / next_review / counts / last_* 全部保留
+}
+
 function overwriteImportedQuestion(local, incoming) {
   const localId = local.id;
   const localCreatedAt = local.created_at;
@@ -1796,12 +1826,14 @@ function askDuplicate(newQ, oldQ, mode = 'create', exact = false) {
     $('#dup-keep').classList.toggle('hidden', exact && !isSync);
     $('#dup-keep').textContent = exact
       ? '覆盖：用备份里的题目和复习状态覆盖本机'
-      : (isSync ? '不是同一题，仍要导入' : '不是同一题，仍要保存');
+      : (isSync ? '不是同一题，仍要导入' : '不是同一题，另存为新题');
+    // 相似题才显示“保留新录入版本”：替换旧题内容，但保留旧复习进度。
+    $('#dup-replace').classList.toggle('hidden', isSync || exact);
     // “从明天重新复习”只属于录入；导入备份不能借这个按钮改统计。
     $('#dup-retry').classList.toggle('hidden', isSync);
     $('#dup-skip').textContent = exact
       ? '跳过：保留本机这道题不变'
-      : (isSync ? '是同一题，跳过不导入' : '是同一题，取消保存');
+      : (isSync ? '是同一题，跳过不导入' : '保留旧版本（跳过）');
     dupForceChoice = exact ? 'overwrite' : 'keep';
     dupResolve = resolve;
     $('#dup-modal').classList.remove('hidden');
@@ -1810,6 +1842,10 @@ function askDuplicate(newQ, oldQ, mode = 'create', exact = false) {
 $('#dup-keep').addEventListener('click', () => {
   $('#dup-modal').classList.add('hidden');
   if (dupResolve) { const choice = dupForceChoice; dupResolve(choice); dupResolve = null; dupForceChoice = 'keep'; }
+});
+$('#dup-replace').addEventListener('click', () => {
+  $('#dup-modal').classList.add('hidden');
+  if (dupResolve) { dupResolve('replace'); dupResolve = null; }
 });
 $('#dup-retry').addEventListener('click', () => {
   $('#dup-modal').classList.add('hidden');
@@ -3741,7 +3777,7 @@ async function importJsonArray(arr) {
   if (importBusy) throw new Error('正在导入，请稍候');
   importBusy = true;
   try {
-    let ok = 0, fail = 0, skipped = 0, retried = 0;
+    let ok = 0, fail = 0, skipped = 0, retried = 0, replaced = 0;
     const existing = await dbGetAll();
     for (let i = 0; i < arr.length; i++) {
       try {
@@ -3753,6 +3789,13 @@ async function importJsonArray(arr) {
           const exact = isSameQuestionContent(q, similar);
           const choice = await askDuplicate(q, similar, 'create', exact);
           if (choice === 'skip') { skipped++; continue; }
+          if (choice === 'replace') {
+            replaceQuestionContentKeepingProgress(similar, q);
+            await dbPut(similar);
+            syncReviewItemAfterImport(similar);
+            replaced++;
+            continue;
+          }
           if (choice === 'retry') {
             await dbPut(resetDuplicateForTomorrow(similar));
             removeQuestionFromQueue(similar.id);
@@ -3769,8 +3812,8 @@ async function importJsonArray(arr) {
         console.warn('第 ' + (i + 1) + ' 题跳过：' + e.message);
       }
     }
-    if (ok > 0 || retried > 0) {
-      toast('成功录入 ' + ok + ' 题' + (retried > 0 ? '，重新安排 ' + retried + ' 题' : '') + (skipped > 0 ? '，跳过重复 ' + skipped + ' 题' : '') + (fail > 0 ? '，失败 ' + fail + ' 题' : ''));
+    if (ok > 0 || retried > 0 || replaced > 0) {
+      toast('成功录入 ' + ok + ' 题' + (replaced > 0 ? '，替换 ' + replaced + ' 题' : '') + (retried > 0 ? '，重新安排 ' + retried + ' 题' : '') + (skipped > 0 ? '，跳过重复 ' + skipped + ' 题' : '') + (fail > 0 ? '，失败 ' + fail + ' 题' : ''));
       loadList();
       refreshBadge();
       await refreshReviewQueueFromDb();
