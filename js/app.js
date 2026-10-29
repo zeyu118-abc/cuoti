@@ -3051,7 +3051,7 @@ function renderListCards(list) {
           <p class="text-sm font-medium whitespace-pre-wrap">${escapeHtml(q.question_text) || '（图片题）'}</p>
         </div>
         <div class="flex items-center gap-3 shrink-0">
-          ${listSelectMode ? '' : `${listView.mode === 'all' && q.bank_id == null ? `<button class="subject-btn text-slate-400 hover:text-primary-500 transition" data-id="${q.id}" title="设置科目"><i class="fa fa-tag"></i></button>` : ''}<i class="fa fa-chevron-right text-slate-400 text-sm"></i>`}
+          ${listSelectMode ? '' : `${listView.mode === 'all' && q.bank_id == null ? `<button class="subject-btn text-slate-400 hover:text-primary-500 transition" data-id="${q.id}" title="设置科目"><i class="fa fa-tag"></i></button>` : ''}<button class="del-btn text-slate-400 hover:text-red-500 transition" data-id="${q.id}" title="删除这道题"><i class="fa fa-trash-o"></i></button><i class="fa fa-chevron-right text-slate-400 text-sm"></i>`}
         </div>
       </div>
     `;
@@ -3070,6 +3070,24 @@ function renderListCards(list) {
       e.stopPropagation();
       const q = list.find((x) => x.id === Number(btn.dataset.id));
       if (q) openSubjectModal(q, 'list');
+    })
+  );
+
+  wrap.querySelectorAll('.del-btn').forEach((btn) =>
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const q = list.find((x) => x.id === Number(btn.dataset.id));
+      if (!q) return;
+      if (!confirm('确定删除这道题吗？')) return;
+      try {
+        await dbDelete(q.id);
+        removeQuestionFromQueue(q.id);
+        refreshBadge();
+        toast('已删除');
+        await loadList();
+      } catch (err) {
+        toast('删除失败：' + err.message, false);
+      }
     })
   );
 }
@@ -3460,7 +3478,7 @@ function renderDetail(q) {
     <div class="mt-5 flex flex-wrap gap-2">
       ${q.bank_id == null ? `<button id="detail-subject" class="px-4 py-2 rounded-lg bg-primary-50 text-primary-600 font-medium hover:bg-primary-100 transition"><i class="fa fa-tag mr-1"></i>设置科目</button>` : ''}
       <button id="detail-edit" class="px-4 py-2 rounded-lg bg-primary-50 text-primary-600 font-medium hover:bg-primary-100 transition"><i class="fa fa-pencil-square-o mr-1"></i>修改题目</button>
-      <button id="detail-delete" class="hidden px-4 py-2 rounded-lg bg-red-50 text-red-600 font-medium hover:bg-red-100 transition"><i class="fa fa-trash-o mr-1"></i>删除此题</button>
+      <button id="detail-delete" class="px-4 py-2 rounded-lg bg-red-50 text-red-600 font-medium hover:bg-red-100 transition"><i class="fa fa-trash-o mr-1"></i>删除此题</button>
     </div>
   `;
 
