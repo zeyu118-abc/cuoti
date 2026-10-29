@@ -2903,7 +2903,7 @@ let listView = { mode: 'all', subject: null, typeFilter: 'all', page: 1 };
 let currentFullList = [];
 let currentPageList = []; // 当前页实际显示的题目（「全选本页」只选这一页）
 // 每页题数，默认 50
-const PAGE_SIZES = [20, 50, 100];
+const PAGE_SIZES = [20, 50, 100, 500, 1000];
 function loadPageSize(key) {
   try {
     const v = parseInt(localStorage.getItem(key), 10);
@@ -3390,7 +3390,7 @@ function goNextPage() {
 $('#list-prev').addEventListener('click', goPrevPage);
 $('#list-next').addEventListener('click', goNextPage);
 
-// 每页题数切换（20/50/100）
+// 每页题数切换（20/50/100/500/1000）
 function closeAllSizeMenus() {
   document.querySelectorAll('.size-menu').forEach((m) => m.classList.add('hidden'));
 }
