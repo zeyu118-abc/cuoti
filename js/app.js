@@ -286,6 +286,17 @@ function restoreSession(saved, all) {
     .filter((x) => x.kind === 'main')
     .sort((a, b) => (a.seq || 0) - (b.seq || 0))
     .forEach((it, i) => { it.seq = i; });
+  // 会话是整份快照，别的标签页可能今天已经作答；以数据库为准纠正旧 pending，避免一天推进两轮
+  reviewQueue.forEach((it) => {
+    const q = it.q;
+    if (it.status === 'pending' && q.last_reviewed === reviewSessionDate &&
+        (q.last_result === 'correct' || q.last_result === 'wrong')) {
+      it.status = q.last_result;
+      it.firstStatus = q.last_result;
+      it.selectedAnswer = [];
+      it.prevSelected = null;
+    }
+  });
   reviewTotal = items.filter((x) => x.kind === 'main').length;
   const savedIndex = typeof saved.index === 'number' ? saved.index : 0;
   reviewIndex = Math.max(0, Math.min(savedIndex, reviewQueue.length - 1));
@@ -1048,10 +1059,13 @@ async function processImageForImport(src, maxW = 1200) {
 
 // 处理题目里的题干图片与各选项图片（JSON 导入用）
 async function processQuestionImages(q) {
+  // 已处理过的备份图不要再压一次：去掉白边后的图 base64 会变，导致同一道题永远匹配不上
+  if (q.img_processed) return q;
   if (q.question_image) q.question_image = await processImageForImport(q.question_image, 1200);
   for (const o of q.options || []) {
     if (o.image) o.image = await processImageForImport(o.image, 800);
   }
+  q.img_processed = true;
   return q;
 }
 
@@ -1603,14 +1617,7 @@ function findSimilar(q, all) {
   for (const existing of all) {
     // 判断与单选/多选题型不同，不可能是同一道题，直接跳过
     if ((q.type === 'judge') !== (existing.type === 'judge')) continue;
-    // 两边都有图但图不同，题干再像也不是同一题（例如同一题干配了不同电路图）
-    const qi = [q.question_image || ''].concat((Array.isArray(q.options) ? q.options : []).map((o) => (o && o.image) || ''));
-    const ei = [existing.question_image || ''].concat((Array.isArray(existing.options) ? existing.options : []).map((o) => (o && o.image) || ''));
-    let imageConflict = false;
-    for (let i = 0; i < Math.max(qi.length, ei.length); i++) {
-      if (qi[i] && ei[i] && qi[i] !== ei[i]) { imageConflict = true; break; }
-    }
-    if (imageConflict) continue;
+    // 图片不同不直接跳过，仍按文字参与评分；是否同一题交给相似题弹窗确认
     const qStem = normalizeText(q.question_text), eStem = normalizeText(existing.question_text);
     // 纯图片/无文字题：只有题干图完全相同才算同一题，不能因为两个空字符串相似度 1 就全部误报
     if (!qStem || !eStem) {
@@ -2041,6 +2048,9 @@ function renderQuestion() {
     const order = contents.map((_, i) => i);
     if (q.type !== 'judge') shuffleArray(order);
     it.order = order;
+    // 选项数量/内容变了，旧的选择标签已经对应不到原选项，直接清掉，避免“没高亮却能提交”
+    it.selectedAnswer = [];
+    it.prevSelected = [];
   }
   const order = it.order;
   const answerSet = new Set(Array.isArray(q.answer) ? q.answer : []);
@@ -2052,6 +2062,9 @@ function renderQuestion() {
   it.contents = contents;
   it.currentAnswer = currentAnswer;
   if (!Array.isArray(it.selectedAnswer)) it.selectedAnswer = [];
+  const validLabels = new Set(labels);
+  it.selectedAnswer = it.selectedAnswer.filter((l) => validLabels.has(l));
+  if (Array.isArray(it.prevSelected)) it.prevSelected = it.prevSelected.filter((l) => validLabels.has(l));
 
   const selectedAnswer = it.selectedAnswer || [];
 
@@ -2509,6 +2522,11 @@ async function submitCurrentAnswer() {
   const it = currentItem();
   if (!it) return;
   if ((it.selectedAnswer || []).length === 0) return toast('请先选择答案', false);
+  const labelSet = new Set(it.labels || []);
+  if (!it.selectedAnswer.every((l) => labelSet.has(l))) {
+    it.selectedAnswer = [];
+    return toast('选项已变化，请重新选择', false);
+  }
   if (it.status !== 'pending' && it.retry !== true) return;
 
   setReviewOptionsLocked(true);
@@ -3563,7 +3581,9 @@ $('#export-btn').addEventListener('click', async () => {
   try {
     const all = await dbGetAll();
     if (all.length === 0) return toast('暂无数据可导出', false);
-    const blob = new Blob([JSON.stringify(all, null, 2)], { type: 'application/json' });
+    // 导出的是已经处理过的图，标记后再次导入不会二次压缩
+    const backup = all.map((q) => ({ ...q, img_processed: true }));
+    const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
@@ -3693,8 +3713,11 @@ $('#import-file').addEventListener('change', async () => {
     }
     hideImportProgress();
     loadList();
-    resetReviewSessionAfterImport();
-    if (!$('#tab-review').classList.contains('hidden')) await loadReview();
+    // 空文件/全部无效/全部跳过时不能重置今天的复习会话，否则会丢当前题、已选答案和错题重做序号
+    if (total + updated > 0) {
+      resetReviewSessionAfterImport();
+      if (!$('#tab-review').classList.contains('hidden')) await loadReview();
+    }
     refreshBadge();
   } catch (e) {
     hideImportProgress();
@@ -4023,6 +4046,7 @@ function normalizeQuestion(raw, idx) {
     last_reviewed: '',
     last_result: '',
     created_at: new Date().toISOString(),
+    img_processed: raw.img_processed === true,
   };
 }
 
@@ -4145,6 +4169,7 @@ function sanitizeBackupQuestion(raw) {
     last_reviewed: isRealDate(raw.last_reviewed) ? raw.last_reviewed : '',
     last_result: raw.last_result === 'correct' || raw.last_result === 'wrong' ? raw.last_result : '',
     created_at: typeof raw.created_at === 'string' && raw.created_at ? raw.created_at : new Date().toISOString(),
+    img_processed: raw.img_processed === true,
   };
   if (Number.isInteger(raw.bank_id)) q.bank_id = raw.bank_id;
   return q;

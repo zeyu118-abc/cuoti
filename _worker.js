@@ -7,12 +7,13 @@
 
 const DEEPSEEK_URL = 'https://api.deepseek.com/chat/completions';
 
-function json(data, status) {
+function json(data, status, extraHeaders = {}) {
   return new Response(JSON.stringify(data), {
     status,
     headers: {
       'Content-Type': 'application/json; charset=utf-8',
       'Cache-Control': 'no-store',
+      ...extraHeaders,
     },
   });
 }
@@ -32,7 +33,72 @@ const MAX_IMAGE_CHARS = 4 * 1024 * 1024;
 const MAX_TOTAL_IMAGE_CHARS = 16 * 1024 * 1024;
 const MAX_BODY_CHARS = 24 * 1024 * 1024;
 
-// 只接受压缩后的本地位图 data URL 或公网 http(s) 图片，其它一律丢弃
+// 基础限流：每个 IP 每分钟最多 30 次 AI 请求，连续失败 8 次锁 10 分钟。
+// 说明：Worker 每个 isolate 内存独立，这是第一层兜底；真正的全局限流用 Cloudflare WAF Rate Limiting。
+const AI_WINDOW_MS = 60_000;
+const AI_MAX_REQUESTS = 30;
+const AI_MAX_FAILURES = 8;
+const AI_LOCK_MS = 10 * 60_000;
+const aiRateBuckets = new Map();
+
+function rateBucket(request) {
+  const ip = request.headers.get('cf-connecting-ip') || 'unknown';
+  const now = Date.now();
+  let bucket = aiRateBuckets.get(ip);
+  if (!bucket || now >= bucket.resetAt) {
+    bucket = { count: 0, resetAt: now + AI_WINDOW_MS, failures: 0, lockedUntil: 0 };
+    aiRateBuckets.set(ip, bucket);
+  }
+  return { ip, bucket, now };
+}
+
+function checkAIRate(request) {
+  const { bucket, now } = rateBucket(request);
+  if (bucket.lockedUntil > now) {
+    return { ok: false, retryAfter: Math.ceil((bucket.lockedUntil - now) / 1000) };
+  }
+  if (now >= bucket.resetAt) {
+    bucket.count = 0;
+    bucket.resetAt = now + AI_WINDOW_MS;
+  }
+  bucket.count++;
+  if (bucket.count > AI_MAX_REQUESTS) {
+    return { ok: false, retryAfter: Math.ceil((bucket.resetAt - now) / 1000) };
+  }
+  return { ok: true };
+}
+
+function markAIFailure(request) {
+  const { bucket, now } = rateBucket(request);
+  bucket.failures++;
+  if (bucket.failures >= AI_MAX_FAILURES) {
+    bucket.lockedUntil = now + AI_LOCK_MS;
+  }
+}
+
+function markAISuccess(request) {
+  const { bucket } = rateBucket(request);
+  bucket.failures = 0;
+}
+
+// 避免逐字符比较被计时；Node/Workers 没有内置 timingSafeEqual 时手写常量时间比较
+function safeEqual(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) return false;
+  let mismatch = 0;
+  for (let i = 0; i < a.length; i++) mismatch |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return mismatch === 0;
+}
+
+// upstream.json() 也要有独立超时，避免 5xx/非流式响应 body 挂住 Worker
+function readJsonWithTimeout(upstream, ms = 10000) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error('timeout')), ms);
+  });
+  return Promise.race([upstream.json(), timeout]).finally(() => clearTimeout(timer));
+}
+
+// 只接受前端压缩后的 data:image 位图；不接受 http(s)，避免把内网/元数据地址交给上游抓取
 function normalizeImage(value) {
   if (typeof value !== 'string') return '';
   const s = value.trim();
@@ -40,8 +106,23 @@ function normalizeImage(value) {
   if (/^data:image\/(png|jpe?g|webp|gif);base64,[A-Za-z0-9+/=\s]+$/i.test(s)) {
     return s.length <= MAX_IMAGE_CHARS ? s : '';
   }
-  if (/^https?:\/\/\S+$/i.test(s) && s.length <= 8192) return s;
   return '';
+}
+
+// Pages Functions 生成的响应不保证套用 _headers，静态/HTML 响应在这里再补一层
+function withSecurityHeaders(response) {
+  const headers = new Headers(response.headers);
+  if (!headers.has('X-Content-Type-Options')) headers.set('X-Content-Type-Options', 'nosniff');
+  if (!headers.has('X-Frame-Options')) headers.set('X-Frame-Options', 'SAMEORIGIN');
+  if (!headers.has('Referrer-Policy')) headers.set('Referrer-Policy', 'no-referrer');
+  if (!headers.has('Permissions-Policy')) headers.set('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  headers.set('Strict-Transport-Security', 'max-age=31536000');
+  // Report-Only 先观察，不直接阻断内联 Tailwind 配置和现有 CDN 脚本
+  headers.set(
+    'Content-Security-Policy-Report-Only',
+    "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.tailwindcss.com https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data: https://cdn.jsdelivr.net; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; object-src 'none'"
+  );
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
 }
 
 function normalizedPath(pathname) {
@@ -79,14 +160,16 @@ export default {
     // 其它请求照常返回网页静态文件
     const asset = await env.ASSETS.fetch(request);
     // 带扩展名的资源缺失时，Pages 可能回退 index.html；不能让浏览器把 HTML 当 JS/CSS
-    if (asset.status === 200 && /\.[a-z0-9]+$/i.test(path) &&
+    // 注意：index.html 本身就是 text/html，不能误杀
+    const ext = (path.match(/\.([a-z0-9]+)$/i) || [])[1]?.toLowerCase();
+    if (asset.status === 200 && ext && !['html', 'htm'].includes(ext) &&
         (asset.headers.get('content-type') || '').includes('text/html')) {
       return new Response('Not found', {
         status: 404,
         headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' },
       });
     }
-    return asset;
+    return withSecurityHeaders(asset);
   },
 };
 
@@ -106,20 +189,37 @@ async function handleAI(request, env) {
     return json({ error: '服务端未配置 AI_TOKEN', code: 'no_token' }, 503);
   }
 
+  const rate = checkAIRate(request);
+  if (!rate.ok) {
+    return json(
+      { error: '请求太频繁，请稍后再试', code: 'rate_limited' },
+      429,
+      { 'Retry-After': String(rate.retryAfter) }
+    );
+  }
+
   const auth = request.headers.get('Authorization') || '';
-  const authorized = auth === 'Bearer ' + env.AI_TOKEN;
+  const authorized = safeEqual(auth, 'Bearer ' + env.AI_TOKEN);
 
   // GET 只用于验证口令，不调用 DeepSeek，不产生费用。
   // 前端只有验证通过后才显示 AI 按钮，别的设备猜错口令也不会出现按钮。
   if (request.method === 'GET') {
-    if (!authorized) return json({ error: '未授权' }, 401);
+    if (!authorized) {
+      markAIFailure(request);
+      return json({ error: '未授权' }, 401);
+    }
+    markAISuccess(request);
     if (!env.DEEPSEEK_API_KEY) {
       return json({ error: '服务端未配置 API Key', code: 'no_api_key' }, 503);
     }
     return json({ ok: true }, 200);
   }
   if (request.method !== 'POST') return json({ error: '只支持 POST' }, 405);
-  if (!authorized) return json({ error: '未授权' }, 401);
+  if (!authorized) {
+    markAIFailure(request);
+    return json({ error: '未授权' }, 401);
+  }
+  markAISuccess(request);
 
   if (!env.DEEPSEEK_API_KEY) {
     return json({ error: '服务端未配置 API Key', code: 'no_api_key' }, 503);
@@ -249,7 +349,13 @@ async function handleAI(request, env) {
 
   if (!upstream.ok) {
     clearTimeout(timer);
-    const data = await upstream.json().catch(() => ({}));
+    let data = {};
+    try {
+      data = await readJsonWithTimeout(upstream);
+    } catch {
+      controller.abort();
+      return json({ error: 'AI 服务响应超时' }, 504);
+    }
     console.error('DeepSeek error', upstream.status, data);
     return json({ error: 'AI 服务错误（' + upstream.status + '）' }, 502);
   }
@@ -258,7 +364,13 @@ async function handleAI(request, env) {
   // 万一上游没按流式返回，退化成一次性 JSON
   if (!contentType.includes('text/event-stream') || !upstream.body) {
     clearTimeout(timer);
-    const data = await upstream.json().catch(() => ({}));
+    let data = {};
+    try {
+      data = await readJsonWithTimeout(upstream);
+    } catch {
+      controller.abort();
+      return json({ error: 'AI 服务响应超时' }, 504);
+    }
     const choice = (data.choices && data.choices[0]) || {};
     const content = messageText(choice.message).trim();
     if (!content) {
