@@ -3009,6 +3009,9 @@ async function loadList() {
   const allWrongCount = all.length;
   $('#list-total-label').textContent = isPlainAll ? '未分类' : '共';
   $('#list-total').textContent = fullList.length;
+  const hideUnclassified = isPlainAll && fullList.length === 0;
+  $('#list-unclassified-wrap').classList.toggle('hidden', hideUnclassified);
+  $('#list-total-sep').classList.toggle('hidden', hideUnclassified);
   $('#list-total-all-wrap').classList.toggle('hidden', !isPlainAll);
   $('#list-total-all').textContent = allWrongCount;
   renderListCards(pageList);
