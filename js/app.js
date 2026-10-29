@@ -3556,6 +3556,20 @@ $('#export-btn').addEventListener('click', async () => {
   }
 });
 
+// 恢复备份后，旧会话里的日期/队列必须整体作废，按数据库重建今日队列。
+function resetReviewSessionAfterImport() {
+  clearReviewAutoTimer();
+  reviewQueue.length = 0;
+  reviewIndex = 0;
+  reviewTotal = 0;
+  isBrowsing = false;
+  isTrophyRedo = false;
+  trophyRedoIds = [];
+  sessionAtTrophy = false;
+  reviewSessionDate = '';
+  try { localStorage.removeItem(SESSION_KEY); } catch (e) {}
+}
+
 // 导入/覆盖之后，复习页内存里的 q 还是旧快照；只刷新“同类对象”，
 // 不重建整个会话，避免打断当前题和已选答案。
 async function refreshReviewQueueFromDb() {
@@ -3589,9 +3603,6 @@ $('#import-file').addEventListener('change', async () => {
   let total = 0, updated = 0, skipped = 0, failed = 0;
   try {
     const existing = await dbGetAll();
-    const today = fmtDate(new Date());
-    const saved = getSavedSession();
-    const sessionToday = !!(saved && saved.date === today);
 
     for (const file of files) {
       let arr;
@@ -3621,10 +3632,6 @@ $('#import-file').addEventListener('change', async () => {
             syncReviewItemAfterImport(exact);
             updated++;
             continue;
-          }
-          // 今日复习会话已开始时，新导入的到期题推迟到明天，避免打乱今日队列与答题卡
-          if (q.next_review && q.next_review <= today && sessionToday) {
-            q.next_review = fmtDate(addDays(new Date(), 1));
           }
           const similar = findSimilar(q, existing);
           if (similar) {
@@ -3659,8 +3666,9 @@ $('#import-file').addEventListener('change', async () => {
       toast(parts.join('，'), total > 0 || updated > 0);
     }
     loadList();
+    resetReviewSessionAfterImport();
+    if (!$('#tab-review').classList.contains('hidden')) await loadReview();
     refreshBadge();
-    await refreshReviewQueueFromDb();
   } catch (e) {
     toast('导入失败：' + e.message, false);
   } finally {
