@@ -2511,8 +2511,8 @@ function renderAnsweredState(it) {
   refreshBottomBar(); // 更新「返回」按钮与「下一题/完成」按钮
   $('#review-note-btn').classList.remove('hidden');
   $('#review-edit-btn').classList.remove('hidden');
-  // 这一版已按用户要求移除删除入口，答题正确时也不再显示“删除此题”
-  $('#review-delete').classList.add('hidden');
+  // 答对后恢复“删除此题”；答错时仍隐藏，避免把错题当场删掉
+  $('#review-delete').classList.toggle('hidden', !correct);
   renderReviewNote(it.q);
   updateAiVisibility();
 }
